@@ -146,15 +146,14 @@ func (s *Server) expireWhatsAppLink(ticket, deviceID string, expiresAt time.Time
 	}
 	s.links.mu.Lock()
 	pending, ok := s.links.pending[ticket]
-	if ok && pending != nil && !s.now().Before(pending.ExpiresAt) {
+	expired := ok && pending != nil && !s.now().Before(pending.ExpiresAt)
+	if expired {
 		delete(s.links.pending, ticket)
 	}
 	s.links.mu.Unlock()
-	if ok && s.linker != nil {
-		if pending != nil {
-			for _, linkedDeviceID := range pending.LinkedDeviceIDs {
-				_ = s.linker.Cleanup(context.Background(), linkedDeviceID)
-			}
+	if expired && s.linker != nil {
+		for _, linkedDeviceID := range pending.LinkedDeviceIDs {
+			_ = s.linker.Cleanup(context.Background(), linkedDeviceID)
 		}
 		_ = s.linker.Cleanup(context.Background(), deviceID)
 	}
@@ -190,8 +189,12 @@ func (s *Server) completeWhatsAppLink(c fiber.Ctx) error {
 	}
 	if !s.now().Before(pending.ExpiresAt) {
 		deviceID := pending.DeviceID
+		linkedDeviceIDs := append([]string(nil), pending.LinkedDeviceIDs...)
 		delete(s.links.pending, ticket)
 		s.links.mu.Unlock()
+		for _, linkedDeviceID := range linkedDeviceIDs {
+			_ = s.linker.Cleanup(context.Background(), linkedDeviceID)
+		}
 		_ = s.linker.Cleanup(context.Background(), deviceID)
 		return oauthError(c, fiber.StatusBadRequest, "invalid_request", "WhatsApp link ticket expired; restart the connection")
 	}
