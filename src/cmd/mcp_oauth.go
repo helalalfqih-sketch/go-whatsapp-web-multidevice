@@ -41,13 +41,13 @@ func init() {
 		&config.McpOAuthDBURI,
 		"mcp-oauth-db-uri",
 		config.McpOAuthDBURI,
-		"SQLite URI for OAuth clients, authorization codes, and tokens",
+		"SQLite or PostgreSQL URI for OAuth clients, authorization codes, and tokens",
 	)
 	rootCmd.PersistentFlags().BoolVar(
 		&config.McpOAuthQRLinking,
 		"mcp-oauth-qr-linking",
 		config.McpOAuthQRLinking,
-		"bind OAuth authorization to one WhatsApp linked-device session via QR",
+		"bind OAuth authorization to one or more WhatsApp linked-device sessions via QR",
 	)
 }
 
