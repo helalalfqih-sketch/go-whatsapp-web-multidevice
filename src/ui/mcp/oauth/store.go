@@ -252,14 +252,14 @@ func (s *store) issueAuthorizationCode(ctx context.Context, grant AuthorizationG
 		return "", err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := cleanupExpiredTx(ctx, tx, now); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, now, s.postgres); err != nil {
 		return "", err
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_authorization_codes (
     code_hash, client_id, subject, redirect_uri, code_challenge,
     resource, scope, expires_at, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.postgres),
 		hashSecret(code),
 		grant.ClientID,
 		grant.Subject,
@@ -291,7 +291,7 @@ func (s *store) exchangeAuthorizationCode(
 		return TokenPair{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := cleanupExpiredTx(ctx, tx, now); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, now, s.postgres); err != nil {
 		return TokenPair{}, err
 	}
 
@@ -305,11 +305,11 @@ func (s *store) exchangeAuthorizationCode(
 		expiresAt     int64
 		usedAt        sql.NullInt64
 	)
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT client_id, subject, redirect_uri, code_challenge, resource, scope,
        expires_at, used_at
 FROM oauth_authorization_codes
-WHERE code_hash = ?`, hashSecret(req.Code)).Scan(
+WHERE code_hash = ?`, s.postgres), hashSecret(req.Code)).Scan(
 		&clientID,
 		&subject,
 		&redirectURI,
@@ -335,10 +335,10 @@ WHERE code_hash = ?`, hashSecret(req.Code)).Scan(
 		return TokenPair{}, ErrInvalidGrant
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, bindOAuthQuery(`
 UPDATE oauth_authorization_codes
 SET used_at = ?
-WHERE code_hash = ? AND used_at IS NULL`, now.Unix(), hashSecret(req.Code))
+WHERE code_hash = ? AND used_at IS NULL`, s.postgres), now.Unix(), hashSecret(req.Code))
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -351,7 +351,7 @@ WHERE code_hash = ? AND used_at IS NULL`, now.Unix(), hashSecret(req.Code))
 	if err != nil {
 		return TokenPair{}, err
 	}
-	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL)
+	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL, s.postgres)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -373,7 +373,7 @@ func (s *store) rotateRefreshToken(
 		return TokenPair{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := cleanupExpiredTx(ctx, tx, now); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, now, s.postgres); err != nil {
 		return TokenPair{}, err
 	}
 
@@ -386,10 +386,10 @@ func (s *store) rotateRefreshToken(
 		expiresAt int64
 		revokedAt sql.NullInt64
 	)
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT family_id, client_id, subject, resource, scope, expires_at, revoked_at
 FROM oauth_tokens
-WHERE token_hash = ? AND token_type = 'refresh'`, hashSecret(req.RefreshToken)).Scan(
+WHERE token_hash = ? AND token_type = 'refresh'`, s.postgres), hashSecret(req.RefreshToken)).Scan(
 		&familyID,
 		&clientID,
 		&subject,
@@ -405,10 +405,10 @@ WHERE token_hash = ? AND token_type = 'refresh'`, hashSecret(req.RefreshToken)).
 		return TokenPair{}, err
 	}
 	if revokedAt.Valid {
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 UPDATE oauth_tokens
 SET revoked_at = ?
-WHERE family_id = ? AND revoked_at IS NULL`, now.Unix(), familyID); err != nil {
+WHERE family_id = ? AND revoked_at IS NULL`, s.postgres), now.Unix(), familyID); err != nil {
 			return TokenPair{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -423,10 +423,10 @@ WHERE family_id = ? AND revoked_at IS NULL`, now.Unix(), familyID); err != nil {
 		return TokenPair{}, ErrInvalidTarget
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, bindOAuthQuery(`
 UPDATE oauth_tokens
 SET revoked_at = ?
-WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`,
+WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`, s.postgres),
 		now.Unix(), hashSecret(req.RefreshToken))
 	if err != nil {
 		return TokenPair{}, err
