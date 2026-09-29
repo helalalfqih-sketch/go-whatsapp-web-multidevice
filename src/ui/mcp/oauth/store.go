@@ -285,6 +285,7 @@ func (s *store) exchangeAuthorizationCode(
 	now time.Time,
 	accessTTL time.Duration,
 	refreshTTL time.Duration,
+	postgres bool,
 ) (TokenPair, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -446,18 +447,18 @@ WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`, s.postg
 	return pair, nil
 }
 
-func cleanupExpiredTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_authorization_codes WHERE expires_at <= ?`, now.Unix()); err != nil {
+func cleanupExpiredTx(ctx context.Context, tx *sql.Tx, now time.Time, postgres bool) error {
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`DELETE FROM oauth_authorization_codes WHERE expires_at <= ?`, postgres), now.Unix()); err != nil {
 		return fmt.Errorf("delete expired authorization codes: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE expires_at <= ?`, now.Unix()); err != nil {
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`DELETE FROM oauth_tokens WHERE expires_at <= ?`, postgres), now.Unix()); err != nil {
 		return fmt.Errorf("delete expired oauth tokens: %w", err)
 	}
 	return nil
 }
 
-func cleanupUnusedClientsTx(ctx context.Context, tx *sql.Tx, cutoff time.Time) error {
-	if _, err := tx.ExecContext(ctx, `
+func cleanupUnusedClientsTx(ctx context.Context, tx *sql.Tx, cutoff time.Time, postgres bool) error {
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 DELETE FROM oauth_clients
 WHERE created_at <= ?
   AND NOT EXISTS (
@@ -467,7 +468,7 @@ WHERE created_at <= ?
   AND NOT EXISTS (
       SELECT 1 FROM oauth_tokens
       WHERE oauth_tokens.client_id = oauth_clients.client_id
-  )`, cutoff.Unix()); err != nil {
+  )`, postgres), cutoff.Unix()); err != nil {
 		return fmt.Errorf("delete unused oauth clients: %w", err)
 	}
 	return nil
@@ -480,10 +481,10 @@ func (s *store) validateAccessToken(ctx context.Context, rawToken, resource stri
 		expiresAt    int64
 		revokedAt    sql.NullInt64
 	)
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT subject, client_id, scope, resource, expires_at, revoked_at
 FROM oauth_tokens
-WHERE token_hash = ? AND token_type = 'access'`, hashSecret(rawToken)).Scan(
+WHERE token_hash = ? AND token_type = 'access'`, s.postgres), hashSecret(rawToken)).Scan(
 		&principal.Subject,
 		&principal.ClientID,
 		&principal.Scope,
@@ -523,20 +524,20 @@ func issueTokenPairTx(
 	if err != nil {
 		return TokenPair{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_tokens (
     token_hash, token_type, family_id, client_id, subject, resource, scope,
     expires_at, created_at
-) VALUES (?, 'access', ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, 'access', ?, ?, ?, ?, ?, ?, ?)`, postgres),
 		hashSecret(accessToken), familyID, clientID, subject, resource, scope,
 		now.Add(accessTTL).Unix(), now.Unix()); err != nil {
 		return TokenPair{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_tokens (
     token_hash, token_type, family_id, client_id, subject, resource, scope,
     expires_at, created_at
-) VALUES (?, 'refresh', ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, 'refresh', ?, ?, ?, ?, ?, ?, ?)`, postgres),
 		hashSecret(refreshToken), familyID, clientID, subject, resource, scope,
 		now.Add(refreshTTL).Unix(), now.Unix()); err != nil {
 		return TokenPair{}, err
