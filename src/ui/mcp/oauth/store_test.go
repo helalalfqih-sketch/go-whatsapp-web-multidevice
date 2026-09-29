@@ -194,3 +194,14 @@ func TestStoreRegistrationRateLimitUsesDurableWindow(t *testing.T) {
 	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM oauth_clients`).Scan(&clients))
 	assert.Equal(t, 2, clients)
 }
+
+
+func TestBindOAuthQueryPostgres(t *testing.T) {
+	query := "SELECT * FROM oauth_tokens WHERE token_hash = ? AND resource = ? AND scope = ?"
+	assert.Equal(
+		t,
+		"SELECT * FROM oauth_tokens WHERE token_hash = $1 AND resource = $2 AND scope = $3",
+		bindOAuthQuery(query, true),
+	)
+	assert.Equal(t, query, bindOAuthQuery(query, false))
+}
