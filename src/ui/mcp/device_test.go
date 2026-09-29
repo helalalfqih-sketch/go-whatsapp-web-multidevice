@@ -62,6 +62,28 @@ func TestResolveDeviceContext(t *testing.T) {
 		require.ErrorContains(t, err, "device identification required")
 	})
 
+	t.Run("oauth-bound device rejects override", func(t *testing.T) {
+		boundDevice := &whatsapp.DeviceInstance{}
+		r := &stubResolver{inst: boundDevice}
+		ctx := withOAuthBoundDevice(context.Background(), "dev1")
+		_, _, err := resolveDeviceContext(ctx, callReq(map[string]any{"device_id": "dev2"}), r)
+		require.ErrorContains(t, err, "does not match")
+		assert.Empty(t, r.gotID)
+	})
+
+	t.Run("oauth-bound device is resolved from token scope", func(t *testing.T) {
+		boundDevice := &whatsapp.DeviceInstance{}
+		r := &stubResolver{inst: boundDevice}
+		ctx := withOAuthBoundDevice(context.Background(), "dev1")
+		newCtx, inst, err := resolveDeviceContext(ctx, callReq(nil), r)
+		require.NoError(t, err)
+		assert.Same(t, boundDevice, inst)
+		assert.Equal(t, "dev1", r.gotID)
+		got, ok := whatsapp.DeviceFromContext(newCtx)
+		require.True(t, ok)
+		assert.Same(t, boundDevice, got)
+	})
+
 	t.Run("nil device stored in context errors", func(t *testing.T) {
 		ctx := whatsapp.ContextWithDevice(context.Background(), nil)
 		_, _, err := resolveDeviceContext(ctx, callReq(nil), &stubResolver{})
