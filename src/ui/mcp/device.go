@@ -19,7 +19,21 @@ type deviceResolver interface {
 // layer from the X-Device-Id header (see route.go) > error. Mirrors REST's
 // DeviceMiddleware semantics for MCP handlers.
 func resolveDeviceContext(ctx context.Context, request mcpg.CallToolRequest, resolver deviceResolver) (context.Context, *whatsapp.DeviceInstance, error) {
-	if deviceID := strings.TrimSpace(request.GetString("device_id", "")); deviceID != "" {
+	requestedDeviceID := strings.TrimSpace(request.GetString("device_id", ""))
+	if boundDeviceID, ok := oauthBoundDevice(ctx); ok {
+		if requestedDeviceID != "" && requestedDeviceID != boundDeviceID {
+			return ctx, nil, errors.New("device_id does not match the WhatsApp account bound to this OAuth token")
+		}
+		if resolver == nil {
+			return ctx, nil, errors.New("device manager not initialized")
+		}
+		inst, _, err := resolver.ResolveDevice(boundDeviceID)
+		if err != nil {
+			return ctx, nil, err
+		}
+		return whatsapp.ContextWithDevice(ctx, inst), inst, nil
+	}
+	if deviceID := requestedDeviceID; deviceID != "" {
 		if resolver == nil {
 			return ctx, nil, errors.New("device manager not initialized")
 		}
