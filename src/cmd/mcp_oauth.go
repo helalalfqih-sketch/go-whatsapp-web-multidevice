@@ -202,6 +202,24 @@ func (l *mcpOAuthWhatsAppLinker) Start(ctx context.Context) (mcpoauth.WhatsAppLi
 	}, nil
 }
 
+func (l *mcpOAuthWhatsAppLinker) Refresh(ctx context.Context, deviceID string) (mcpoauth.WhatsAppLink, error) {
+	if l == nil || l.app == nil || strings.TrimSpace(deviceID) == "" {
+		return mcpoauth.WhatsAppLink{}, errors.New("WhatsApp linker is not initialized")
+	}
+	resp, err := l.app.Login(ctx, deviceID)
+	if err != nil {
+		return mcpoauth.WhatsAppLink{}, err
+	}
+	qrBytes, err := os.ReadFile(resp.ImagePath)
+	if err != nil {
+		return mcpoauth.WhatsAppLink{}, fmt.Errorf("read refreshed WhatsApp QR image: %w", err)
+	}
+	return mcpoauth.WhatsAppLink{
+		DeviceID: deviceID,
+		QRBase64: base64.StdEncoding.EncodeToString(qrBytes),
+	}, nil
+}
+
 func (l *mcpOAuthWhatsAppLinker) IsLinked(ctx context.Context, deviceID string) (bool, error) {
 	if l == nil || l.app == nil {
 		return false, errors.New("WhatsApp linker is not initialized")
