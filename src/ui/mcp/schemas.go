@@ -169,7 +169,7 @@ const appSchema = `{
   "type": "object",
   "required": ["action"],
   "properties": {
-    "action": {"type": "string", "enum": ["status","login_qr","login_code","logout","reconnect"], "description": "Connection/session operation. login_qr returns a QR image; logout clears stored credentials (destructive)"},
+    "action": {"type": "string", "enum": ["list_accounts","status","login_qr","login_code","logout","reconnect"], "description": "Connection/session operation. list_accounts returns only WhatsApp accounts allowed by the current OAuth connection; login_qr returns a QR image; logout clears stored credentials (destructive)"},
     "device_id": {"type": "string", "description": "Act as this device instead of the connection default"},
     "phone": {"type": "string", "description": "login_code: phone number in international format (e.g. +628123456789)"}
   },
