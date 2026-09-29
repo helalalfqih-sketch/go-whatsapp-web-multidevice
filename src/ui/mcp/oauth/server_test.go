@@ -356,7 +356,11 @@ func TestOAuthQRLinkingSupportsMultipleWhatsAppAccounts(t *testing.T) {
 		"ticket": {secondMatch[1]},
 		"action": {"complete"},
 	})
-	require.Equal(t, fiber.StatusFound, resp.StatusCode)
+	if resp.StatusCode != fiber.StatusFound {
+		failureBody, readErr := io.ReadAll(resp.Body)
+		require.NoError(t, readErr)
+		t.Fatalf("multi-account completion status=%d body=%s", resp.StatusCode, string(failureBody))
+	}
 	callback, err := url.Parse(resp.Header.Get("Location"))
 	require.NoError(t, err)
 	code := callback.Query().Get("code")
