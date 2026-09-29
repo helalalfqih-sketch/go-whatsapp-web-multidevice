@@ -78,6 +78,12 @@ var whatsappLinkTemplate = template.Must(template.New("oauth-whatsapp-link").Par
 </html>`))
 
 func (s *Server) startWhatsAppLink(c fiber.Ctx, req authorizationRequest, client Client) error {
+	// Fiber/fasthttp body-bound strings may alias the request buffer, which is
+	// reused after this handler returns. Clone every persisted string before
+	// storing authorization state across the QR follow-up requests.
+	req = cloneAuthorizationRequest(req)
+	client = cloneOAuthClient(client)
+
 	if s.linker == nil || s.links == nil {
 		return oauthError(c, fiber.StatusServiceUnavailable, "temporarily_unavailable", "WhatsApp QR linking is not configured")
 	}
@@ -334,4 +340,35 @@ func containsDeviceID(deviceIDs []string, deviceID string) bool {
 		}
 	}
 	return false
+}
+
+
+func cloneAuthorizationRequest(req authorizationRequest) authorizationRequest {
+	return authorizationRequest{
+		ResponseType:        strings.Clone(req.ResponseType),
+		ClientID:            strings.Clone(req.ClientID),
+		RedirectURI:         strings.Clone(req.RedirectURI),
+		CodeChallenge:       strings.Clone(req.CodeChallenge),
+		CodeChallengeMethod: strings.Clone(req.CodeChallengeMethod),
+		Resource:            strings.Clone(req.Resource),
+		Scope:               strings.Clone(req.Scope),
+		State:               strings.Clone(req.State),
+		Username:            strings.Clone(req.Username),
+		Password:            strings.Clone(req.Password),
+	}
+}
+
+func cloneOAuthClient(client Client) Client {
+	redirects := make([]string, len(client.RedirectURIs))
+	for i, redirectURI := range client.RedirectURIs {
+		redirects[i] = strings.Clone(redirectURI)
+	}
+	return Client{
+		ID:                      strings.Clone(client.ID),
+		Name:                    strings.Clone(client.Name),
+		RedirectURIs:            redirects,
+		ApplicationType:         strings.Clone(client.ApplicationType),
+		TokenEndpointAuthMethod: strings.Clone(client.TokenEndpointAuthMethod),
+		CreatedAt:               client.CreatedAt,
+	}
 }
