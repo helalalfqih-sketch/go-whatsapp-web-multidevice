@@ -1,12 +1,16 @@
 package cmd
 
 import (
+	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainApp "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/app"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	uimcp "github.com/aldinokemal/go-whatsapp-web-multidevice/ui/mcp"
 	mcpoauth "github.com/aldinokemal/go-whatsapp-web-multidevice/ui/mcp/oauth"
@@ -37,7 +41,13 @@ func init() {
 		&config.McpOAuthDBURI,
 		"mcp-oauth-db-uri",
 		config.McpOAuthDBURI,
-		"SQLite URI for OAuth clients, authorization codes, and tokens",
+		"SQLite or PostgreSQL URI for OAuth clients, authorization codes, and tokens",
+	)
+	rootCmd.PersistentFlags().BoolVar(
+		&config.McpOAuthQRLinking,
+		"mcp-oauth-qr-linking",
+		config.McpOAuthQRLinking,
+		"bind OAuth authorization to one or more WhatsApp linked-device sessions via QR",
 	)
 }
 
@@ -66,6 +76,11 @@ func loadMcpOAuthEnvConfig() {
 			config.McpOAuthDBURI = value
 		}
 	}
+	if flag := flags.Lookup("mcp-oauth-qr-linking"); flag == nil || !flag.Changed {
+		if viper.IsSet("mcp_oauth_qr_linking") {
+			config.McpOAuthQRLinking = viper.GetBool("mcp_oauth_qr_linking")
+		}
+	}
 }
 
 // registerMcpOAuth must run before the application's global Basic Auth
@@ -89,10 +104,17 @@ func registerMcpOAuth(app *fiber.App, dm *whatsapp.DeviceManager) (*mcpoauth.Ser
 		}
 	}
 
+	var linker mcpoauth.WhatsAppLinker
+	if config.McpOAuthQRLinking {
+		linker = &mcpOAuthWhatsAppLinker{dm: dm, app: appUsecase}
+	}
+
 	oauthServer, err := mcpoauth.New(mcpoauth.Config{
 		IssuerURL:   config.McpOAuthIssuerURL,
 		ResourceURL: resourceURL,
 		StorageURI:  config.McpOAuthDBURI,
+		QRLinking:   config.McpOAuthQRLinking,
+		Linker:      linker,
 	}, validateCredential)
 	if err != nil {
 		return nil, false, err
@@ -144,4 +166,71 @@ func mcpOAuthCredentialValidator(credentials []string) (mcpoauth.CredentialValid
 		}
 		return subtle.ConstantTimeCompare([]byte(password), []byte(expected)) == 1
 	}, nil
+}
+
+
+type mcpOAuthWhatsAppLinker struct {
+	dm  *whatsapp.DeviceManager
+	app domainApp.IAppUsecase
+}
+
+func (l *mcpOAuthWhatsAppLinker) Start(ctx context.Context) (mcpoauth.WhatsAppLink, error) {
+	if l == nil || l.dm == nil || l.app == nil {
+		return mcpoauth.WhatsAppLink{}, errors.New("WhatsApp linker is not initialized")
+	}
+	inst, err := l.dm.CreateDevice(ctx, "")
+	if err != nil {
+		return mcpoauth.WhatsAppLink{}, err
+	}
+	cleanup := func() {
+		_ = l.dm.PurgeDevice(context.Background(), inst.ID())
+	}
+
+	resp, err := l.app.Login(ctx, inst.ID())
+	if err != nil {
+		cleanup()
+		return mcpoauth.WhatsAppLink{}, err
+	}
+	qrBytes, err := os.ReadFile(resp.ImagePath)
+	if err != nil {
+		cleanup()
+		return mcpoauth.WhatsAppLink{}, fmt.Errorf("read WhatsApp QR image: %w", err)
+	}
+	return mcpoauth.WhatsAppLink{
+		DeviceID: inst.ID(),
+		QRBase64: base64.StdEncoding.EncodeToString(qrBytes),
+	}, nil
+}
+
+func (l *mcpOAuthWhatsAppLinker) Refresh(ctx context.Context, deviceID string) (mcpoauth.WhatsAppLink, error) {
+	if l == nil || l.app == nil || strings.TrimSpace(deviceID) == "" {
+		return mcpoauth.WhatsAppLink{}, errors.New("WhatsApp linker is not initialized")
+	}
+	resp, err := l.app.Login(ctx, deviceID)
+	if err != nil {
+		return mcpoauth.WhatsAppLink{}, err
+	}
+	qrBytes, err := os.ReadFile(resp.ImagePath)
+	if err != nil {
+		return mcpoauth.WhatsAppLink{}, fmt.Errorf("read refreshed WhatsApp QR image: %w", err)
+	}
+	return mcpoauth.WhatsAppLink{
+		DeviceID: deviceID,
+		QRBase64: base64.StdEncoding.EncodeToString(qrBytes),
+	}, nil
+}
+
+func (l *mcpOAuthWhatsAppLinker) IsLinked(ctx context.Context, deviceID string) (bool, error) {
+	if l == nil || l.app == nil {
+		return false, errors.New("WhatsApp linker is not initialized")
+	}
+	_, loggedIn, err := l.app.Status(ctx, deviceID)
+	return loggedIn, err
+}
+
+func (l *mcpOAuthWhatsAppLinker) Cleanup(ctx context.Context, deviceID string) error {
+	if l == nil || l.dm == nil || strings.TrimSpace(deviceID) == "" {
+		return nil
+	}
+	return l.dm.PurgeDevice(ctx, deviceID)
 }

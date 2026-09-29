@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -22,6 +24,69 @@ const (
 	testResource = "https://gowa.example.com/mcp"
 	testRedirect = "https://claude.ai/api/mcp/auth_callback"
 )
+
+
+type fakeWhatsAppLinker struct {
+	linked    bool
+	cleaned   []string
+	deviceID  string
+	deviceIDs []string
+	starts    int
+}
+
+func (f *fakeWhatsAppLinker) Start(context.Context) (WhatsAppLink, error) {
+	deviceID := f.deviceID
+	if len(f.deviceIDs) > 0 {
+		index := f.starts
+		if index >= len(f.deviceIDs) {
+			index = len(f.deviceIDs) - 1
+		}
+		deviceID = f.deviceIDs[index]
+	}
+	if deviceID == "" {
+		deviceID = "device-123"
+	}
+	f.starts++
+	return WhatsAppLink{
+		DeviceID: deviceID,
+		QRBase64: base64.StdEncoding.EncodeToString([]byte("fake-png")),
+	}, nil
+}
+
+func (f *fakeWhatsAppLinker) Refresh(_ context.Context, deviceID string) (WhatsAppLink, error) {
+	return WhatsAppLink{
+		DeviceID: deviceID,
+		QRBase64: base64.StdEncoding.EncodeToString([]byte("refreshed-fake-png")),
+	}, nil
+}
+
+func (f *fakeWhatsAppLinker) IsLinked(context.Context, string) (bool, error) {
+	return f.linked, nil
+}
+
+func (f *fakeWhatsAppLinker) Cleanup(_ context.Context, deviceID string) error {
+	f.cleaned = append(f.cleaned, deviceID)
+	return nil
+}
+
+func newOAuthQRTestServer(t *testing.T, linker WhatsAppLinker) (*Server, *fiber.App) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "oauth-qr.db")
+	srv, err := New(Config{
+		IssuerURL:   testIssuer,
+		ResourceURL: testResource,
+		StorageURI:  "file:" + filepath.ToSlash(dbPath),
+		QRLinking:   true,
+		Linker:      linker,
+	}, func(username, password string) bool {
+		return username == "user" && password == "secret"
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, srv.Close()) })
+	app := fiber.New()
+	srv.RegisterPublic(app)
+	return srv, app
+}
 
 func newOAuthTestServer(t *testing.T, issuer, resource string) (*Server, *fiber.App) {
 	t.Helper()
@@ -186,6 +251,159 @@ func TestAuthorizationCodeFlowBearerAndBasicFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 	assert.Contains(t, resp.Header.Get("WWW-Authenticate"), `Bearer resource_metadata="https://gowa.example.com/.well-known/oauth-protected-resource/mcp"`)
+}
+
+
+func TestOAuthQRLinkingBindsBearerToWhatsAppDevice(t *testing.T) {
+	linker := &fakeWhatsAppLinker{deviceID: "device-123"}
+	srv, app := newOAuthQRTestServer(t, linker)
+	clientID := registerTestClient(t, app)
+
+	verifier := strings.Repeat("q", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	form := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {testRedirect},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"resource":              {testResource},
+		"scope":                 {"mcp"},
+		"state":                 {"state-qr"},
+		"username":              {"user"},
+		"password":              {"secret"},
+	}
+
+	resp := postForm(t, app, "/oauth/authorize", form)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "Link WhatsApp")
+	assert.Contains(t, string(body), "data:image/png;base64,")
+	assert.Contains(t, resp.Header.Get("Content-Security-Policy"), "img-src data:")
+
+	match := regexp.MustCompile(`name="ticket" value="([^"]+)"`).FindStringSubmatch(string(body))
+	require.Len(t, match, 2)
+	ticket := match[1]
+
+	resp = postForm(t, app, "/oauth/link/complete", url.Values{"ticket": {ticket}})
+	require.Equal(t, fiber.StatusConflict, resp.StatusCode)
+
+	linker.linked = true
+	resp = postForm(t, app, "/oauth/link/complete", url.Values{"ticket": {ticket}})
+	require.Equal(t, fiber.StatusFound, resp.StatusCode)
+	callback, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := callback.Query().Get("code")
+	require.NotEmpty(t, code)
+	assert.Equal(t, "state-qr", callback.Query().Get("state"))
+
+	tokens := exchangeTestCode(t, app, clientID, code, verifier, testResource)
+
+	protected := app.Group("", srv.MCPAuthMiddleware(nil))
+	protected.Post("/bound-device", func(c fiber.Ctx) error {
+		return c.SendString(c.Get("X-Device-Id"))
+	})
+
+	req := httptest.NewRequest("POST", "/bound-device", nil)
+	req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+	req.Header.Set("X-Device-Id", "attacker-selected-device")
+	resp, err = app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	deviceHeader, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "device-123", string(deviceHeader), "OAuth-bound device must overwrite client selection")
+}
+
+
+func TestOAuthQRLinkingSupportsMultipleWhatsAppAccounts(t *testing.T) {
+	linker := &fakeWhatsAppLinker{deviceIDs: []string{"device-1", "device-2"}}
+	srv, app := newOAuthQRTestServer(t, linker)
+	clientID := registerTestClient(t, app)
+
+	verifier := strings.Repeat("m", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	form := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {testRedirect},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"resource":              {testResource},
+		"scope":                 {"mcp"},
+		"state":                 {"state-multi"},
+		"username":              {"user"},
+		"password":              {"secret"},
+	}
+
+	resp := postForm(t, app, "/oauth/authorize", form)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	firstMatch := regexp.MustCompile(`name="ticket" value="([^"]+)"`).FindStringSubmatch(string(body))
+	require.Len(t, firstMatch, 2)
+
+	linker.linked = true
+	resp = postForm(t, app, "/oauth/link/complete", url.Values{
+		"ticket": {firstMatch[1]},
+		"action": {"add"},
+	})
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "1 account(s) already linked")
+	secondMatch := regexp.MustCompile(`name="ticket" value="([^"]+)"`).FindStringSubmatch(string(body))
+	require.Len(t, secondMatch, 2)
+	assert.NotEqual(t, firstMatch[1], secondMatch[1])
+
+	resp = postForm(t, app, "/oauth/link/complete", url.Values{
+		"ticket": {secondMatch[1]},
+		"action": {"complete"},
+	})
+	if resp.StatusCode != fiber.StatusFound {
+		failureBody, readErr := io.ReadAll(resp.Body)
+		require.NoError(t, readErr)
+		t.Fatalf("multi-account completion status=%d body=%s", resp.StatusCode, string(failureBody))
+	}
+	callback, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := callback.Query().Get("code")
+	require.NotEmpty(t, code)
+
+	tokens := exchangeTestCode(t, app, clientID, code, verifier, testResource)
+
+	protected := app.Group("", srv.MCPAuthMiddleware(nil))
+	protected.Post("/multi-bound", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"allowed":  c.Get(AllowedDevicesHeader),
+			"selected": c.Get("X-Device-Id"),
+		})
+	})
+
+	req := httptest.NewRequest("POST", "/multi-bound", nil)
+	req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+	req.Header.Set("X-Device-Id", "attacker-device")
+	resp, err = app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	var scope map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&scope))
+	assert.Equal(t, "device-1,device-2", scope["allowed"])
+	assert.Equal(t, "", scope["selected"], "unauthorized transport selector must be cleared")
+
+	req = httptest.NewRequest("POST", "/multi-bound", nil)
+	req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+	req.Header.Set("X-Device-Id", "device-2")
+	resp, err = app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	scope = map[string]any{}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&scope))
+	assert.Equal(t, "device-1,device-2", scope["allowed"])
+	assert.Equal(t, "device-2", scope["selected"])
 }
 
 func TestTokenExchangeRejectsWrongResourceAndCodeReplay(t *testing.T) {

@@ -35,6 +35,9 @@ type Server struct {
 	resource           *url.URL
 	store              *store
 	validateCredential CredentialValidator
+	qrLinking          bool
+	linker             WhatsAppLinker
+	links              *linkState
 	now                func() time.Time
 }
 
@@ -120,6 +123,9 @@ func New(cfg Config, validateCredential CredentialValidator) (*Server, error) {
 	if validateCredential == nil {
 		return nil, errors.New("MCP OAuth requires a credential validator")
 	}
+	if cfg.QRLinking && cfg.Linker == nil {
+		return nil, errors.New("MCP OAuth QR linking requires a WhatsApp linker")
+	}
 	issuer, err := normalizePublicURL(cfg.IssuerURL, "issuer")
 	if err != nil {
 		return nil, err
@@ -144,6 +150,9 @@ func New(cfg Config, validateCredential CredentialValidator) (*Server, error) {
 		resource:           resource,
 		store:              store,
 		validateCredential: validateCredential,
+		qrLinking:          cfg.QRLinking,
+		linker:             cfg.Linker,
+		links:              newLinkState(),
 		now:                func() time.Time { return time.Now().UTC() },
 	}, nil
 }
@@ -172,6 +181,7 @@ func (s *Server) RegisterPublic(app *fiber.App) {
 	app.Post(s.issuerEndpointPath("/oauth/register"), s.registerClient)
 	app.Get(s.issuerEndpointPath("/oauth/authorize"), s.authorizeGET)
 	app.Post(s.issuerEndpointPath("/oauth/authorize"), s.authorizePOST)
+	app.Post(s.issuerEndpointPath("/oauth/link/complete"), s.completeWhatsAppLink)
 	app.Post(s.issuerEndpointPath("/oauth/token"), s.token)
 }
 
@@ -181,6 +191,7 @@ func (s *Server) limitPublicPOSTBodies(app *fiber.App) {
 	paths := []string{
 		routingPathKey(s.issuerEndpointPath("/oauth/register")),
 		routingPathKey(s.issuerEndpointPath("/oauth/authorize")),
+		routingPathKey(s.issuerEndpointPath("/oauth/link/complete")),
 		routingPathKey(s.issuerEndpointPath("/oauth/token")),
 	}
 	previous := app.Server().HeaderReceived
@@ -230,6 +241,10 @@ func routingPathKey(p string) string {
 
 func (s *Server) MCPAuthMiddleware(basic CredentialValidator) fiber.Handler {
 	return func(c fiber.Ctx) error {
+		// This header is internal trust context. Never accept a client-supplied
+		// value; bearer validation below recreates it from the token subject.
+		c.Request().Header.Del(AllowedDevicesHeader)
+
 		scheme, credentials := splitAuthorization(c.Get(fiber.HeaderAuthorization))
 		switch strings.ToLower(scheme) {
 		case "bearer":
@@ -242,6 +257,28 @@ func (s *Server) MCPAuthMiddleware(basic CredentialValidator) fiber.Handler {
 			}
 			c.Locals("oauth_subject", principal.Subject)
 			c.Locals("oauth_client_id", principal.ClientID)
+
+			deviceIDs, ok := DeviceIDsFromSubject(principal.Subject)
+			if !ok {
+				// Once QR-bound OAuth is enabled, legacy bearer tokens without
+				// a WhatsApp device scope must not regain arbitrary device access.
+				if s.qrLinking {
+					return s.mcpUnauthorized(c, basic != nil, true)
+				}
+				return c.Next()
+			}
+			c.Request().Header.Set(AllowedDevicesHeader, strings.Join(deviceIDs, ","))
+
+			requested := strings.TrimSpace(c.Get("X-Device-Id"))
+			if len(deviceIDs) == 1 {
+				// Preserve the original single-account behavior.
+				c.Request().Header.Set("X-Device-Id", deviceIDs[0])
+			} else if requested == "" || !containsDeviceID(deviceIDs, requested) {
+				// A multi-account token may select only one of its own devices.
+				// Clear an absent or unauthorized client header; tool-level
+				// device_id selection is checked again inside resolveDeviceContext.
+				c.Request().Header.Del("X-Device-Id")
+			}
 			return c.Next()
 		case "basic":
 			if basic == nil {
@@ -397,6 +434,9 @@ func (s *Server) authorizePOST(c fiber.Ctx) error {
 	}
 	if !s.validateCredential(req.Username, req.Password) {
 		return s.renderAuthorize(c, fiber.StatusUnauthorized, req, client, "Invalid username or password.")
+	}
+	if s.qrLinking {
+		return s.startWhatsAppLink(c, req, client)
 	}
 	code, err := s.store.issueAuthorizationCode(c.Context(), AuthorizationGrant{
 		ClientID:      req.ClientID,

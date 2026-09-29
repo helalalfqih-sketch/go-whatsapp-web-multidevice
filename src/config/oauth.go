@@ -8,4 +8,7 @@ var (
 	McpOAuthIssuerURL   = ""
 	McpOAuthResourceURL = ""
 	McpOAuthDBURI       = "file:storages/oauth.db"
+	// When enabled, OAuth authorization binds the resulting token to one WhatsApp
+	// linked-device session after a QR scan. Basic Auth still gates starting the flow.
+	McpOAuthQRLinking    = false
 )

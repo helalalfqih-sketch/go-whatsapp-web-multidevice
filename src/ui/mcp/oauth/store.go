@@ -11,13 +11,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/sqlite"
+	_ "github.com/lib/pq"
 )
 
 type store struct {
 	db                        *sql.DB
+	postgres                  bool
 	maxClients                int
 	maxRegistrationsPerWindow int
 	registrationWindow        time.Duration
@@ -75,13 +78,28 @@ CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client_id ON oauth_tokens(client_id)
 `
 
 func openStore(uri string) (*store, error) {
-	db, err := sql.Open(sqlite.DriverName, sqlite.FormatChatStorageURI(uri, true, true))
+	uri = strings.TrimSpace(uri)
+	postgres := strings.HasPrefix(uri, "postgres://") || strings.HasPrefix(uri, "postgresql://")
+
+	driver := sqlite.DriverName
+	dsn := sqlite.FormatChatStorageURI(uri, true, true)
+	if postgres {
+		driver = "postgres"
+		dsn = uri
+	}
+
+	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open oauth storage: %w", err)
 	}
-	// OAuth writes are low-volume and transaction-sensitive. One connection
-	// avoids SQLite write races while still keeping WAL enabled for durability.
-	db.SetMaxOpenConns(1)
+	if postgres {
+		db.SetMaxOpenConns(4)
+		db.SetMaxIdleConns(4)
+	} else {
+		// OAuth writes are low-volume and transaction-sensitive. One connection
+		// avoids SQLite write races while still keeping WAL enabled for durability.
+		db.SetMaxOpenConns(1)
+	}
 
 	ctx := context.Background()
 	if err := db.PingContext(ctx); err != nil {
@@ -94,11 +112,30 @@ func openStore(uri string) (*store, error) {
 	}
 	return &store{
 		db:                        db,
+		postgres:                  postgres,
 		maxClients:                defaultMaxClients,
 		maxRegistrationsPerWindow: defaultMaxRegistrationsPerWindow,
 		registrationWindow:        defaultRegistrationWindow,
 		unusedClientTTL:           defaultUnusedClientTTL,
 	}, nil
+}
+
+func bindOAuthQuery(query string, postgres bool) string {
+	if !postgres {
+		return query
+	}
+	var b strings.Builder
+	b.Grow(len(query) + 16)
+	index := 1
+	for _, r := range query {
+		if r == '?' {
+			fmt.Fprintf(&b, "$%d", index)
+			index++
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func (s *store) Close() error {
@@ -109,23 +146,23 @@ func (s *store) Close() error {
 }
 
 func (s *store) createClient(ctx context.Context, client Client) error {
-	return insertClient(ctx, s.db, client)
+	return insertClient(ctx, s.db, client, s.postgres)
 }
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func insertClient(ctx context.Context, ex execer, client Client) error {
+func insertClient(ctx context.Context, ex execer, client Client, postgres bool) error {
 	redirects, err := json.Marshal(client.RedirectURIs)
 	if err != nil {
 		return fmt.Errorf("encode oauth redirect URIs: %w", err)
 	}
-	_, err = ex.ExecContext(ctx, `
+	_, err = ex.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_clients (
     client_id, client_name, redirect_uris_json, application_type,
     token_endpoint_auth_method, created_at
-) VALUES (?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?)`, postgres),
 		client.ID,
 		client.Name,
 		string(redirects),
@@ -149,10 +186,10 @@ func (s *store) registerClient(ctx context.Context, client Client) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := cleanupExpiredTx(ctx, tx, client.CreatedAt); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, client.CreatedAt, s.postgres); err != nil {
 		return err
 	}
-	if err := cleanupUnusedClientsTx(ctx, tx, client.CreatedAt.Add(-s.unusedClientTTL)); err != nil {
+	if err := cleanupUnusedClientsTx(ctx, tx, client.CreatedAt.Add(-s.unusedClientTTL), s.postgres); err != nil {
 		return err
 	}
 	var total int
@@ -164,15 +201,15 @@ func (s *store) registerClient(ctx context.Context, client Client) error {
 	}
 	var recent int
 	windowStart := client.CreatedAt.Add(-s.registrationWindow).Unix()
-	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM oauth_clients WHERE created_at > ?`, windowStart).Scan(&recent); err != nil {
+	if err := tx.QueryRowContext(ctx, bindOAuthQuery(`
+SELECT COUNT(*) FROM oauth_clients WHERE created_at > ?`, s.postgres), windowStart).Scan(&recent); err != nil {
 		return err
 	}
 	if recent >= s.maxRegistrationsPerWindow {
 		return ErrRegistrationLimit
 	}
 
-	if err := insertClient(ctx, tx, client); err != nil {
+	if err := insertClient(ctx, tx, client, s.postgres); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -184,10 +221,10 @@ func (s *store) getClient(ctx context.Context, clientID string) (Client, error) 
 		redirectsJSON string
 		createdAt     int64
 	)
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT client_id, client_name, redirect_uris_json, application_type,
        token_endpoint_auth_method, created_at
-FROM oauth_clients WHERE client_id = ?`, clientID).Scan(
+FROM oauth_clients WHERE client_id = ?`, s.postgres), clientID).Scan(
 		&client.ID,
 		&client.Name,
 		&redirectsJSON,
@@ -215,14 +252,14 @@ func (s *store) issueAuthorizationCode(ctx context.Context, grant AuthorizationG
 		return "", err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := cleanupExpiredTx(ctx, tx, now); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, now, s.postgres); err != nil {
 		return "", err
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_authorization_codes (
     code_hash, client_id, subject, redirect_uri, code_challenge,
     resource, scope, expires_at, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.postgres),
 		hashSecret(code),
 		grant.ClientID,
 		grant.Subject,
@@ -254,7 +291,7 @@ func (s *store) exchangeAuthorizationCode(
 		return TokenPair{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := cleanupExpiredTx(ctx, tx, now); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, now, s.postgres); err != nil {
 		return TokenPair{}, err
 	}
 
@@ -268,11 +305,11 @@ func (s *store) exchangeAuthorizationCode(
 		expiresAt     int64
 		usedAt        sql.NullInt64
 	)
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT client_id, subject, redirect_uri, code_challenge, resource, scope,
        expires_at, used_at
 FROM oauth_authorization_codes
-WHERE code_hash = ?`, hashSecret(req.Code)).Scan(
+WHERE code_hash = ?`, s.postgres), hashSecret(req.Code)).Scan(
 		&clientID,
 		&subject,
 		&redirectURI,
@@ -298,10 +335,10 @@ WHERE code_hash = ?`, hashSecret(req.Code)).Scan(
 		return TokenPair{}, ErrInvalidGrant
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, bindOAuthQuery(`
 UPDATE oauth_authorization_codes
 SET used_at = ?
-WHERE code_hash = ? AND used_at IS NULL`, now.Unix(), hashSecret(req.Code))
+WHERE code_hash = ? AND used_at IS NULL`, s.postgres), now.Unix(), hashSecret(req.Code))
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -314,7 +351,7 @@ WHERE code_hash = ? AND used_at IS NULL`, now.Unix(), hashSecret(req.Code))
 	if err != nil {
 		return TokenPair{}, err
 	}
-	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL)
+	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL, s.postgres)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -336,7 +373,7 @@ func (s *store) rotateRefreshToken(
 		return TokenPair{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := cleanupExpiredTx(ctx, tx, now); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, now, s.postgres); err != nil {
 		return TokenPair{}, err
 	}
 
@@ -349,10 +386,10 @@ func (s *store) rotateRefreshToken(
 		expiresAt int64
 		revokedAt sql.NullInt64
 	)
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT family_id, client_id, subject, resource, scope, expires_at, revoked_at
 FROM oauth_tokens
-WHERE token_hash = ? AND token_type = 'refresh'`, hashSecret(req.RefreshToken)).Scan(
+WHERE token_hash = ? AND token_type = 'refresh'`, s.postgres), hashSecret(req.RefreshToken)).Scan(
 		&familyID,
 		&clientID,
 		&subject,
@@ -368,10 +405,10 @@ WHERE token_hash = ? AND token_type = 'refresh'`, hashSecret(req.RefreshToken)).
 		return TokenPair{}, err
 	}
 	if revokedAt.Valid {
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 UPDATE oauth_tokens
 SET revoked_at = ?
-WHERE family_id = ? AND revoked_at IS NULL`, now.Unix(), familyID); err != nil {
+WHERE family_id = ? AND revoked_at IS NULL`, s.postgres), now.Unix(), familyID); err != nil {
 			return TokenPair{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -386,10 +423,10 @@ WHERE family_id = ? AND revoked_at IS NULL`, now.Unix(), familyID); err != nil {
 		return TokenPair{}, ErrInvalidTarget
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, bindOAuthQuery(`
 UPDATE oauth_tokens
 SET revoked_at = ?
-WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`,
+WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`, s.postgres),
 		now.Unix(), hashSecret(req.RefreshToken))
 	if err != nil {
 		return TokenPair{}, err
@@ -399,7 +436,7 @@ WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`,
 		return TokenPair{}, ErrInvalidGrant
 	}
 
-	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL)
+	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL, s.postgres)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -409,18 +446,18 @@ WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`,
 	return pair, nil
 }
 
-func cleanupExpiredTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_authorization_codes WHERE expires_at <= ?`, now.Unix()); err != nil {
+func cleanupExpiredTx(ctx context.Context, tx *sql.Tx, now time.Time, postgres bool) error {
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`DELETE FROM oauth_authorization_codes WHERE expires_at <= ?`, postgres), now.Unix()); err != nil {
 		return fmt.Errorf("delete expired authorization codes: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE expires_at <= ?`, now.Unix()); err != nil {
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`DELETE FROM oauth_tokens WHERE expires_at <= ?`, postgres), now.Unix()); err != nil {
 		return fmt.Errorf("delete expired oauth tokens: %w", err)
 	}
 	return nil
 }
 
-func cleanupUnusedClientsTx(ctx context.Context, tx *sql.Tx, cutoff time.Time) error {
-	if _, err := tx.ExecContext(ctx, `
+func cleanupUnusedClientsTx(ctx context.Context, tx *sql.Tx, cutoff time.Time, postgres bool) error {
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 DELETE FROM oauth_clients
 WHERE created_at <= ?
   AND NOT EXISTS (
@@ -430,7 +467,7 @@ WHERE created_at <= ?
   AND NOT EXISTS (
       SELECT 1 FROM oauth_tokens
       WHERE oauth_tokens.client_id = oauth_clients.client_id
-  )`, cutoff.Unix()); err != nil {
+  )`, postgres), cutoff.Unix()); err != nil {
 		return fmt.Errorf("delete unused oauth clients: %w", err)
 	}
 	return nil
@@ -443,10 +480,10 @@ func (s *store) validateAccessToken(ctx context.Context, rawToken, resource stri
 		expiresAt    int64
 		revokedAt    sql.NullInt64
 	)
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT subject, client_id, scope, resource, expires_at, revoked_at
 FROM oauth_tokens
-WHERE token_hash = ? AND token_type = 'access'`, hashSecret(rawToken)).Scan(
+WHERE token_hash = ? AND token_type = 'access'`, s.postgres), hashSecret(rawToken)).Scan(
 		&principal.Subject,
 		&principal.ClientID,
 		&principal.Scope,
@@ -477,6 +514,7 @@ func issueTokenPairTx(
 	now time.Time,
 	accessTTL,
 	refreshTTL time.Duration,
+	postgres bool,
 ) (TokenPair, error) {
 	accessToken, err := randomSecret("gowa_at_", 32)
 	if err != nil {
@@ -486,20 +524,20 @@ func issueTokenPairTx(
 	if err != nil {
 		return TokenPair{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_tokens (
     token_hash, token_type, family_id, client_id, subject, resource, scope,
     expires_at, created_at
-) VALUES (?, 'access', ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, 'access', ?, ?, ?, ?, ?, ?, ?)`, postgres),
 		hashSecret(accessToken), familyID, clientID, subject, resource, scope,
 		now.Add(accessTTL).Unix(), now.Unix()); err != nil {
 		return TokenPair{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_tokens (
     token_hash, token_type, family_id, client_id, subject, resource, scope,
     expires_at, created_at
-) VALUES (?, 'refresh', ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, 'refresh', ?, ?, ?, ?, ?, ?, ?)`, postgres),
 		hashSecret(refreshToken), familyID, clientID, subject, resource, scope,
 		now.Add(refreshTTL).Unix(), now.Unix()); err != nil {
 		return TokenPair{}, err

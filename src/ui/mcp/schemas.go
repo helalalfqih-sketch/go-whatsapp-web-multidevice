@@ -1,5 +1,24 @@
 package mcp
 
+const catalogSchema = `{
+  "type": "object",
+  "required": ["action"],
+  "properties": {
+    "action": {"type": "string", "enum": ["list_products","get_product","list_collections"], "description": "Read-only WhatsApp Business catalog operation"},
+    "device_id": {"type": "string", "description": "Act as this device instead of the OAuth-bound/default device"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "list_products/list_collections: max items per request"},
+    "cursor": {"type": "string", "description": "list_products: pagination cursor returned by the previous call"},
+    "product_id": {"type": "string", "description": "get_product: WhatsApp catalog product ID"},
+    "retailer_id": {"type": "string", "description": "get_product: retailer-defined product ID"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"action": {"const": "get_product"}}},
+      "then": {"anyOf": [{"required": ["product_id"]}, {"required": ["retailer_id"]}]}
+    }
+  ]
+}`
+
 // Raw JSON Schemas for the consolidated tools. mcp-go validates tool calls
 // against these before handlers run (santhosh-tekuri/jsonschema/v6), so the
 // allOf/if/then conditionals are enforced, not advisory.
@@ -150,7 +169,7 @@ const appSchema = `{
   "type": "object",
   "required": ["action"],
   "properties": {
-    "action": {"type": "string", "enum": ["status","login_qr","login_code","logout","reconnect"], "description": "Connection/session operation. login_qr returns a QR image; logout clears stored credentials (destructive)"},
+    "action": {"type": "string", "enum": ["list_accounts","status","login_qr","login_code","logout","reconnect"], "description": "Connection/session operation. list_accounts returns only WhatsApp accounts allowed by the current OAuth connection; login_qr returns a QR image; logout clears stored credentials (destructive)"},
     "device_id": {"type": "string", "description": "Act as this device instead of the connection default"},
     "phone": {"type": "string", "description": "login_code: phone number in international format (e.g. +628123456789)"}
   },

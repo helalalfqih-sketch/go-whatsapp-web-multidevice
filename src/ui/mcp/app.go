@@ -24,7 +24,7 @@ func InitMcpApp(appService domainApp.IAppUsecase, resolver deviceResolver) *AppH
 
 func (h *AppHandler) AddAppTools(mcpServer *server.MCPServer) {
 	tool := mcpg.NewTool("whatsapp_app",
-		mcpg.WithDescription("WhatsApp connection and session management: status, login_qr (returns QR image), login_code (pairing code for a phone number), logout, reconnect."),
+		mcpg.WithDescription("WhatsApp connection and session management: list_accounts, status, login_qr (returns QR image), login_code (pairing code for a phone number), logout, reconnect."),
 		mcpg.WithTitleAnnotation("Connection & Session"),
 		mcpg.WithReadOnlyHintAnnotation(false),
 		mcpg.WithDestructiveHintAnnotation(true),
@@ -38,16 +38,38 @@ func (h *AppHandler) AddAppTools(mcpServer *server.MCPServer) {
 }
 
 func (h *AppHandler) handleApp(ctx context.Context, request mcpg.CallToolRequest) (*mcpg.CallToolResult, error) {
+	action, err := request.RequireString("action")
+	if err != nil {
+		return mcpg.NewToolResultError(err.Error()), nil
+	}
+
+	if action == "list_accounts" {
+		deviceIDs, ok := oauthAllowedDevices(ctx)
+		if !ok || len(deviceIDs) == 0 {
+			return mcpg.NewToolResultError("list_accounts is available for OAuth connections with linked WhatsApp accounts"), nil
+		}
+		accounts := make([]map[string]any, 0, len(deviceIDs))
+		for _, deviceID := range deviceIDs {
+			connected, loggedIn, statusErr := h.appService.Status(ctx, deviceID)
+			account := map[string]any{
+				"device_id":    deviceID,
+				"is_connected": connected,
+				"is_logged_in": loggedIn,
+			}
+			if statusErr != nil {
+				account["error"] = statusErr.Error()
+			}
+			accounts = append(accounts, account)
+		}
+		structured := map[string]any{"accounts": accounts, "count": len(accounts)}
+		return mcpg.NewToolResultStructured(structured, fmt.Sprintf("%d WhatsApp account(s) linked to this OAuth connection", len(accounts))), nil
+	}
+
 	ctx, inst, err := resolveDeviceContext(ctx, request, h.resolver)
 	if err != nil {
 		return mcpg.NewToolResultError(err.Error()), nil
 	}
 	deviceID := inst.ID()
-
-	action, err := request.RequireString("action")
-	if err != nil {
-		return mcpg.NewToolResultError(err.Error()), nil
-	}
 
 	switch action {
 	case "status":
