@@ -84,6 +84,36 @@ func TestResolveDeviceContext(t *testing.T) {
 		assert.Same(t, boundDevice, got)
 	})
 
+
+	t.Run("oauth multi-account requires explicit selection", func(t *testing.T) {
+		r := &stubResolver{inst: &whatsapp.DeviceInstance{}}
+		ctx := withOAuthAllowedDevices(context.Background(), []string{"dev1", "dev2"})
+		_, _, err := resolveDeviceContext(ctx, callReq(nil), r)
+		require.ErrorContains(t, err, "multiple WhatsApp accounts")
+		assert.Empty(t, r.gotID)
+	})
+
+	t.Run("oauth multi-account allows one authorized device", func(t *testing.T) {
+		boundDevice := &whatsapp.DeviceInstance{}
+		r := &stubResolver{inst: boundDevice}
+		ctx := withOAuthAllowedDevices(context.Background(), []string{"dev1", "dev2"})
+		newCtx, inst, err := resolveDeviceContext(ctx, callReq(map[string]any{"device_id": "dev2"}), r)
+		require.NoError(t, err)
+		assert.Same(t, boundDevice, inst)
+		assert.Equal(t, "dev2", r.gotID)
+		got, ok := whatsapp.DeviceFromContext(newCtx)
+		require.True(t, ok)
+		assert.Same(t, boundDevice, got)
+	})
+
+	t.Run("oauth multi-account rejects device outside allowlist", func(t *testing.T) {
+		r := &stubResolver{inst: &whatsapp.DeviceInstance{}}
+		ctx := withOAuthAllowedDevices(context.Background(), []string{"dev1", "dev2"})
+		_, _, err := resolveDeviceContext(ctx, callReq(map[string]any{"device_id": "dev3"}), r)
+		require.ErrorContains(t, err, "not authorized")
+		assert.Empty(t, r.gotID)
+	})
+
 	t.Run("nil device stored in context errors", func(t *testing.T) {
 		ctx := whatsapp.ContextWithDevice(context.Background(), nil)
 		_, _, err := resolveDeviceContext(ctx, callReq(nil), &stubResolver{})
