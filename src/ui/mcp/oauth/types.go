@@ -1,7 +1,9 @@
 package oauth
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -15,10 +17,37 @@ var (
 
 type CredentialValidator func(username, password string) bool
 
+const deviceSubjectPrefix = "whatsapp-device:"
+
+type WhatsAppLink struct {
+	DeviceID string
+	QRBase64 string
+}
+
+type WhatsAppLinker interface {
+	Start(ctx context.Context) (WhatsAppLink, error)
+	IsLinked(ctx context.Context, deviceID string) (bool, error)
+	Cleanup(ctx context.Context, deviceID string) error
+}
+
+func DeviceSubject(deviceID string) string {
+	return deviceSubjectPrefix + strings.TrimSpace(deviceID)
+}
+
+func DeviceIDFromSubject(subject string) (string, bool) {
+	if !strings.HasPrefix(subject, deviceSubjectPrefix) {
+		return "", false
+	}
+	deviceID := strings.TrimSpace(strings.TrimPrefix(subject, deviceSubjectPrefix))
+	return deviceID, deviceID != ""
+}
+
 type Config struct {
 	IssuerURL   string
 	ResourceURL string
 	StorageURI  string
+	QRLinking   bool
+	Linker      WhatsAppLinker
 }
 
 type Client struct {
