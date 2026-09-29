@@ -437,7 +437,7 @@ WHERE token_hash = ? AND token_type = 'refresh' AND revoked_at IS NULL`, s.postg
 		return TokenPair{}, ErrInvalidGrant
 	}
 
-	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL)
+	pair, err := issueTokenPairTx(ctx, tx, familyID, clientID, subject, resource, scope, now, accessTTL, refreshTTL, s.postgres)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -515,6 +515,7 @@ func issueTokenPairTx(
 	now time.Time,
 	accessTTL,
 	refreshTTL time.Duration,
+	postgres bool,
 ) (TokenPair, error) {
 	accessToken, err := randomSecret("gowa_at_", 32)
 	if err != nil {
