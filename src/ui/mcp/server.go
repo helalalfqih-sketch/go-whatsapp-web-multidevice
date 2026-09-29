@@ -23,7 +23,7 @@ type Deps struct {
 	Group    domainGroup.IGroupUsecase
 }
 
-// NewServer builds the MCPServer with the 6 consolidated tools registered.
+// NewServer builds the MCPServer with the consolidated WhatsApp tools registered.
 func NewServer(deps Deps, resolver deviceResolver) *server.MCPServer {
 	s := server.NewMCPServer(
 		"WhatsApp Web Multidevice MCP Server",
@@ -40,5 +40,6 @@ func NewServer(deps Deps, resolver deviceResolver) *server.MCPServer {
 	InitMcpChat(deps.Chat, deps.User, resolver).AddChatTools(s)
 	InitMcpGroup(deps.Group, resolver).AddGroupTools(s)
 	InitMcpApp(deps.App, resolver).AddAppTools(s)
+	InitMcpCatalog(resolver).AddCatalogTools(s)
 	return s
 }
