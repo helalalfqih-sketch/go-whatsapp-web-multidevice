@@ -86,8 +86,9 @@ func newStateBackupManagerFromEnv() *stateBackupManager {
 	if len(config.AppBasicAuthCredential) > 0 {
 		basicAuth = strings.TrimSpace(config.AppBasicAuthCredential[0])
 	}
-	if basicAuth == "" {
-		logrus.Warn("[STATE_BACKUP] disabled: APP_BASIC_AUTH is required for the state gateway")
+	parts := strings.SplitN(basicAuth, ":", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || parts[1] == "" {
+		logrus.Warn("[STATE_BACKUP] disabled: APP_BASIC_AUTH must contain username:password")
 		return nil
 	}
 
@@ -263,7 +264,11 @@ func (m *stateBackupManager) gatewayRequest(ctx context.Context, method string) 
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(strings.SplitN(m.basicAuth, ":", 2)[0], strings.SplitN(m.basicAuth, ":", 2)[1])
+	parts := strings.SplitN(m.basicAuth, ":", 2)
+	if len(parts) != 2 {
+		return nil, errors.New("invalid state gateway credential")
+	}
+	req.SetBasicAuth(parts[0], parts[1])
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := m.client.Do(req)
@@ -329,7 +334,14 @@ func (m *stateBackupManager) download(ctx context.Context) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("signed download returned HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, stateBackupMaxBytes+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, stateBackupMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > stateBackupMaxBytes {
+		return nil, errors.New("remote state exceeds maximum size")
+	}
+	return body, nil
 }
 
 func buildStateArchive() ([]byte, error) {
@@ -596,16 +608,22 @@ func oauthDBURIFromEnv() string {
 }
 
 func localStatePresent() bool {
-	for _, path := range []string{
-		sqlitePathFromURI(config.DBURI),
-		sqlitePathFromURI(oauthDBURIFromEnv()),
-	} {
-		if path == "" {
-			continue
-		}
-		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
-			return true
-		}
+	whatsappPath := sqlitePathFromURI(config.DBURI)
+	if !nonEmptyFile(whatsappPath) {
+		return false
 	}
-	return false
+
+	oauthEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("MCP_OAUTH_ENABLED")), "true")
+	if !oauthEnabled {
+		return true
+	}
+	return nonEmptyFile(sqlitePathFromURI(oauthDBURIFromEnv()))
+}
+
+func nonEmptyFile(path string) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.Size() > 0
 }
