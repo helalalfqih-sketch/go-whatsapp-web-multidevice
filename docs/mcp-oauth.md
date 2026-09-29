@@ -6,7 +6,7 @@ OAuth is **disabled by default**. When it is enabled:
 
 - `/mcp` accepts either `Authorization: Bearer <token>` or the existing Basic Auth credentials.
 - The browser authorization page authenticates against the same `APP_BASIC_AUTH` accounts used by the REST API; there is no second user database.
-- OAuth clients, authorization codes, and token hashes are persisted in `storages/oauth.db` by default.
+- OAuth clients, authorization codes, and token hashes are persisted in `storages/oauth.db` by default. `MCP_OAUTH_DB_URI` can also point to PostgreSQL for durable cloud deployments.
 - Existing REST/UI authentication is unchanged.
 
 ## Configuration
@@ -35,7 +35,7 @@ The equivalent CLI flags are:
 
 ## WhatsApp QR-bound OAuth
 
-This fork adds an opt-in mode that binds each OAuth grant to exactly one WhatsApp linked-device slot.
+This fork adds an opt-in mode that binds each OAuth grant to one or more WhatsApp linked-device slots.
 
 ```env
 APP_BASIC_AUTH=admin:replace-with-a-strong-password
@@ -52,8 +52,10 @@ Flow:
 2. The operator signs in with the existing GOWA Basic Auth account.
 3. GOWA creates a fresh device slot and shows a WhatsApp QR code.
 4. The operator scans it from **WhatsApp → Linked devices → Link a device**.
-5. After the scan is confirmed, GOWA issues an OAuth code whose subject is bound to that device.
-6. Bearer requests overwrite client-supplied `X-Device-Id`, and MCP rejects any per-tool `device_id` that attempts to select another device.
+5. After each scan is confirmed, the operator can either continue to ChatGPT or add another WhatsApp account (up to 10 accounts per OAuth connection).
+6. GOWA issues an OAuth code whose subject carries the allowlist of linked device slots.
+7. Single-account tokens preserve the existing automatic device selection. Multi-account tokens require selecting one allowed `device_id` per tool call (or an allowed `X-Device-Id` header).
+8. MCP rejects any selector outside the OAuth token's device allowlist. The `whatsapp_app` action `list_accounts` returns the accounts available to that OAuth connection.
 
 The QR-link ticket is short-lived and kept only in process memory. If the service restarts during the QR step, restart the authorization flow. Completed WhatsApp sessions and normal OAuth tokens retain the existing GOWA persistence behavior.
 
