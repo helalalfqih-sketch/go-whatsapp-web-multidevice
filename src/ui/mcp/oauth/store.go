@@ -11,13 +11,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/sqlite"
+	_ "github.com/lib/pq"
 )
 
 type store struct {
 	db                        *sql.DB
+	postgres                  bool
 	maxClients                int
 	maxRegistrationsPerWindow int
 	registrationWindow        time.Duration
@@ -75,13 +78,28 @@ CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client_id ON oauth_tokens(client_id)
 `
 
 func openStore(uri string) (*store, error) {
-	db, err := sql.Open(sqlite.DriverName, sqlite.FormatChatStorageURI(uri, true, true))
+	uri = strings.TrimSpace(uri)
+	postgres := strings.HasPrefix(uri, "postgres://") || strings.HasPrefix(uri, "postgresql://")
+
+	driver := sqlite.DriverName
+	dsn := sqlite.FormatChatStorageURI(uri, true, true)
+	if postgres {
+		driver = "postgres"
+		dsn = uri
+	}
+
+	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open oauth storage: %w", err)
 	}
-	// OAuth writes are low-volume and transaction-sensitive. One connection
-	// avoids SQLite write races while still keeping WAL enabled for durability.
-	db.SetMaxOpenConns(1)
+	if postgres {
+		db.SetMaxOpenConns(4)
+		db.SetMaxIdleConns(4)
+	} else {
+		// OAuth writes are low-volume and transaction-sensitive. One connection
+		// avoids SQLite write races while still keeping WAL enabled for durability.
+		db.SetMaxOpenConns(1)
+	}
 
 	ctx := context.Background()
 	if err := db.PingContext(ctx); err != nil {
@@ -94,11 +112,30 @@ func openStore(uri string) (*store, error) {
 	}
 	return &store{
 		db:                        db,
+		postgres:                  postgres,
 		maxClients:                defaultMaxClients,
 		maxRegistrationsPerWindow: defaultMaxRegistrationsPerWindow,
 		registrationWindow:        defaultRegistrationWindow,
 		unusedClientTTL:           defaultUnusedClientTTL,
 	}, nil
+}
+
+func bindOAuthQuery(query string, postgres bool) string {
+	if !postgres {
+		return query
+	}
+	var b strings.Builder
+	b.Grow(len(query) + 16)
+	index := 1
+	for _, r := range query {
+		if r == '?' {
+			fmt.Fprintf(&b, "$%d", index)
+			index++
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func (s *store) Close() error {
