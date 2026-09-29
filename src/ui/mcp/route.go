@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	mcpoauth "github.com/aldinokemal/go-whatsapp-web-multidevice/ui/mcp/oauth"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/middleware"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
@@ -20,16 +21,44 @@ import (
 // the connection (empty resolves the default device, same as
 // DeviceMiddleware); a per-call device_id tool argument overrides it (see
 // resolveDeviceContext).
-type oauthBoundDeviceKey struct{}
+type oauthAllowedDevicesKey struct{}
 
+func withOAuthAllowedDevices(ctx context.Context, deviceIDs []string) context.Context {
+	clean := make([]string, 0, len(deviceIDs))
+	seen := make(map[string]struct{}, len(deviceIDs))
+	for _, id := range deviceIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		clean = append(clean, id)
+	}
+	return context.WithValue(ctx, oauthAllowedDevicesKey{}, clean)
+}
+
+func oauthAllowedDevices(ctx context.Context) ([]string, bool) {
+	deviceIDs, ok := ctx.Value(oauthAllowedDevicesKey{}).([]string)
+	if !ok || len(deviceIDs) == 0 {
+		return nil, false
+	}
+	return append([]string(nil), deviceIDs...), true
+}
+
+// Backward-compatible helper for existing single-device tests/callers.
 func withOAuthBoundDevice(ctx context.Context, deviceID string) context.Context {
-	return context.WithValue(ctx, oauthBoundDeviceKey{}, deviceID)
+	return withOAuthAllowedDevices(ctx, []string{deviceID})
 }
 
 func oauthBoundDevice(ctx context.Context) (string, bool) {
-	deviceID, ok := ctx.Value(oauthBoundDeviceKey{}).(string)
-	deviceID = strings.TrimSpace(deviceID)
-	return deviceID, ok && deviceID != ""
+	deviceIDs, ok := oauthAllowedDevices(ctx)
+	if !ok || len(deviceIDs) != 1 {
+		return "", false
+	}
+	return deviceIDs[0], true
 }
 
 func Register(router fiber.Router, dm *whatsapp.DeviceManager, deps Deps) {
@@ -57,6 +86,37 @@ func Register(router fiber.Router, dm *whatsapp.DeviceManager, deps Deps) {
 			if dm == nil {
 				return ctx
 			}
+
+			authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+			isBearer := false
+			if fields := strings.Fields(authorization); len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+				isBearer = true
+			}
+
+			if isBearer {
+				rawAllowed := strings.TrimSpace(r.Header.Get(mcpoauth.AllowedDevicesHeader))
+				if rawAllowed != "" {
+					allowed := strings.Split(rawAllowed, ",")
+					ctx = withOAuthAllowedDevices(ctx, allowed)
+
+					deviceID := strings.TrimSpace(r.Header.Get(middleware.DeviceIDHeader))
+					if deviceID == "" && len(allowed) == 1 {
+						deviceID = strings.TrimSpace(allowed[0])
+					}
+					if deviceID == "" {
+						// Multi-account token with no transport-level selection.
+						// Tool-level device_id will resolve the intended account.
+						return ctx
+					}
+					inst, _, err := dm.ResolveDevice(deviceID)
+					if err != nil {
+						logrus.Debugf("MCP OAuth device resolution failed for %q: %v", deviceID, err)
+						return ctx
+					}
+					return whatsapp.ContextWithDevice(ctx, inst)
+				}
+			}
+
 			deviceID := strings.TrimSpace(r.Header.Get(middleware.DeviceIDHeader))
 			inst, _, err := dm.ResolveDevice(deviceID)
 			if err != nil {
@@ -65,12 +125,7 @@ func Register(router fiber.Router, dm *whatsapp.DeviceManager, deps Deps) {
 				logrus.Debugf("MCP device resolution failed for %q: %v", deviceID, err)
 				return ctx
 			}
-			ctx = whatsapp.ContextWithDevice(ctx, inst)
-			authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-			if fields := strings.Fields(authorization); len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
-				ctx = withOAuthBoundDevice(ctx, inst.ID())
-			}
-			return ctx
+			return whatsapp.ContextWithDevice(ctx, inst)
 		}),
 	)
 
