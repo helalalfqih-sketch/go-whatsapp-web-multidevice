@@ -146,23 +146,23 @@ func (s *store) Close() error {
 }
 
 func (s *store) createClient(ctx context.Context, client Client) error {
-	return insertClient(ctx, s.db, client)
+	return insertClient(ctx, s.db, client, s.postgres)
 }
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func insertClient(ctx context.Context, ex execer, client Client) error {
+func insertClient(ctx context.Context, ex execer, client Client, postgres bool) error {
 	redirects, err := json.Marshal(client.RedirectURIs)
 	if err != nil {
 		return fmt.Errorf("encode oauth redirect URIs: %w", err)
 	}
-	_, err = ex.ExecContext(ctx, `
+	_, err = ex.ExecContext(ctx, bindOAuthQuery(`
 INSERT INTO oauth_clients (
     client_id, client_name, redirect_uris_json, application_type,
     token_endpoint_auth_method, created_at
-) VALUES (?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?)`, postgres),
 		client.ID,
 		client.Name,
 		string(redirects),
@@ -186,10 +186,10 @@ func (s *store) registerClient(ctx context.Context, client Client) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := cleanupExpiredTx(ctx, tx, client.CreatedAt); err != nil {
+	if err := cleanupExpiredTx(ctx, tx, client.CreatedAt, s.postgres); err != nil {
 		return err
 	}
-	if err := cleanupUnusedClientsTx(ctx, tx, client.CreatedAt.Add(-s.unusedClientTTL)); err != nil {
+	if err := cleanupUnusedClientsTx(ctx, tx, client.CreatedAt.Add(-s.unusedClientTTL), s.postgres); err != nil {
 		return err
 	}
 	var total int
@@ -201,15 +201,15 @@ func (s *store) registerClient(ctx context.Context, client Client) error {
 	}
 	var recent int
 	windowStart := client.CreatedAt.Add(-s.registrationWindow).Unix()
-	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM oauth_clients WHERE created_at > ?`, windowStart).Scan(&recent); err != nil {
+	if err := tx.QueryRowContext(ctx, bindOAuthQuery(`
+SELECT COUNT(*) FROM oauth_clients WHERE created_at > ?`, s.postgres), windowStart).Scan(&recent); err != nil {
 		return err
 	}
 	if recent >= s.maxRegistrationsPerWindow {
 		return ErrRegistrationLimit
 	}
 
-	if err := insertClient(ctx, tx, client); err != nil {
+	if err := insertClient(ctx, tx, client, s.postgres); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -221,10 +221,10 @@ func (s *store) getClient(ctx context.Context, clientID string) (Client, error) 
 		redirectsJSON string
 		createdAt     int64
 	)
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, bindOAuthQuery(`
 SELECT client_id, client_name, redirect_uris_json, application_type,
        token_endpoint_auth_method, created_at
-FROM oauth_clients WHERE client_id = ?`, clientID).Scan(
+FROM oauth_clients WHERE client_id = ?`, s.postgres), clientID).Scan(
 		&client.ID,
 		&client.Name,
 		&redirectsJSON,
