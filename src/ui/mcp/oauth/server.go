@@ -35,6 +35,9 @@ type Server struct {
 	resource           *url.URL
 	store              *store
 	validateCredential CredentialValidator
+	qrLinking          bool
+	linker             WhatsAppLinker
+	links              *linkState
 	now                func() time.Time
 }
 
@@ -120,6 +123,9 @@ func New(cfg Config, validateCredential CredentialValidator) (*Server, error) {
 	if validateCredential == nil {
 		return nil, errors.New("MCP OAuth requires a credential validator")
 	}
+	if cfg.QRLinking && cfg.Linker == nil {
+		return nil, errors.New("MCP OAuth QR linking requires a WhatsApp linker")
+	}
 	issuer, err := normalizePublicURL(cfg.IssuerURL, "issuer")
 	if err != nil {
 		return nil, err
@@ -144,6 +150,9 @@ func New(cfg Config, validateCredential CredentialValidator) (*Server, error) {
 		resource:           resource,
 		store:              store,
 		validateCredential: validateCredential,
+		qrLinking:          cfg.QRLinking,
+		linker:             cfg.Linker,
+		links:              newLinkState(),
 		now:                func() time.Time { return time.Now().UTC() },
 	}, nil
 }
@@ -172,6 +181,7 @@ func (s *Server) RegisterPublic(app *fiber.App) {
 	app.Post(s.issuerEndpointPath("/oauth/register"), s.registerClient)
 	app.Get(s.issuerEndpointPath("/oauth/authorize"), s.authorizeGET)
 	app.Post(s.issuerEndpointPath("/oauth/authorize"), s.authorizePOST)
+	app.Post(s.issuerEndpointPath("/oauth/link/complete"), s.completeWhatsAppLink)
 	app.Post(s.issuerEndpointPath("/oauth/token"), s.token)
 }
 
@@ -181,6 +191,7 @@ func (s *Server) limitPublicPOSTBodies(app *fiber.App) {
 	paths := []string{
 		routingPathKey(s.issuerEndpointPath("/oauth/register")),
 		routingPathKey(s.issuerEndpointPath("/oauth/authorize")),
+		routingPathKey(s.issuerEndpointPath("/oauth/link/complete")),
 		routingPathKey(s.issuerEndpointPath("/oauth/token")),
 	}
 	previous := app.Server().HeaderReceived
@@ -242,6 +253,12 @@ func (s *Server) MCPAuthMiddleware(basic CredentialValidator) fiber.Handler {
 			}
 			c.Locals("oauth_subject", principal.Subject)
 			c.Locals("oauth_client_id", principal.ClientID)
+			if deviceID, ok := DeviceIDFromSubject(principal.Subject); ok {
+				// Bearer tokens issued by the QR flow are hard-bound to one
+				// WhatsApp device. Overwrite any client-supplied selector before
+				// the MCP HTTP adaptor sees the request.
+				c.Request().Header.Set("X-Device-Id", deviceID)
+			}
 			return c.Next()
 		case "basic":
 			if basic == nil {
@@ -397,6 +414,9 @@ func (s *Server) authorizePOST(c fiber.Ctx) error {
 	}
 	if !s.validateCredential(req.Username, req.Password) {
 		return s.renderAuthorize(c, fiber.StatusUnauthorized, req, client, "Invalid username or password.")
+	}
+	if s.qrLinking {
+		return s.startWhatsAppLink(c, req, client)
 	}
 	code, err := s.store.issueAuthorizationCode(c.Context(), AuthorizationGrant{
 		ClientID:      req.ClientID,
