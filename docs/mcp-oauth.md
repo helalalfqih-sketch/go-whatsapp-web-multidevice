@@ -33,6 +33,30 @@ The equivalent CLI flags are:
 --mcp-oauth-db-uri
 ```
 
+## WhatsApp QR-bound OAuth
+
+This fork adds an opt-in mode that binds each OAuth grant to exactly one WhatsApp linked-device slot.
+
+```env
+APP_BASIC_AUTH=admin:replace-with-a-strong-password
+MCP_ENABLED=true
+MCP_OAUTH_ENABLED=true
+MCP_OAUTH_QR_LINKING=true
+MCP_OAUTH_ISSUER_URL=https://gowa.example.com
+MCP_OAUTH_RESOURCE_URL=https://gowa.example.com/mcp
+```
+
+Flow:
+
+1. The MCP client starts the standard OAuth authorization-code + PKCE flow.
+2. The operator signs in with the existing GOWA Basic Auth account.
+3. GOWA creates a fresh device slot and shows a WhatsApp QR code.
+4. The operator scans it from **WhatsApp → Linked devices → Link a device**.
+5. After the scan is confirmed, GOWA issues an OAuth code whose subject is bound to that device.
+6. Bearer requests overwrite client-supplied `X-Device-Id`, and MCP rejects any per-tool `device_id` that attempts to select another device.
+
+The QR-link ticket is short-lived and kept only in process memory. If the service restarts during the QR step, restart the authorization flow. Completed WhatsApp sessions and normal OAuth tokens retain the existing GOWA persistence behavior.
+
 ## Claude custom connector
 
 Expose the GOWA MCP resource over HTTPS, then use the canonical MCP URL when adding the custom connector:
