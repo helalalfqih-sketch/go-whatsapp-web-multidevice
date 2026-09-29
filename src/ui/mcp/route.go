@@ -20,6 +20,18 @@ import (
 // the connection (empty resolves the default device, same as
 // DeviceMiddleware); a per-call device_id tool argument overrides it (see
 // resolveDeviceContext).
+type oauthBoundDeviceKey struct{}
+
+func withOAuthBoundDevice(ctx context.Context, deviceID string) context.Context {
+	return context.WithValue(ctx, oauthBoundDeviceKey{}, deviceID)
+}
+
+func oauthBoundDevice(ctx context.Context) (string, bool) {
+	deviceID, ok := ctx.Value(oauthBoundDeviceKey{}).(string)
+	deviceID = strings.TrimSpace(deviceID)
+	return deviceID, ok && deviceID != ""
+}
+
 func Register(router fiber.Router, dm *whatsapp.DeviceManager, deps Deps) {
 	// dm is typed here, but handlers take the deviceResolver interface;
 	// a nil *DeviceManager must become a nil interface, not a typed nil.
@@ -53,7 +65,12 @@ func Register(router fiber.Router, dm *whatsapp.DeviceManager, deps Deps) {
 				logrus.Debugf("MCP device resolution failed for %q: %v", deviceID, err)
 				return ctx
 			}
-			return whatsapp.ContextWithDevice(ctx, inst)
+			ctx = whatsapp.ContextWithDevice(ctx, inst)
+			authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+			if fields := strings.Fields(authorization); len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+				ctx = withOAuthBoundDevice(ctx, inst.ID())
+			}
+			return ctx
 		}),
 	)
 
