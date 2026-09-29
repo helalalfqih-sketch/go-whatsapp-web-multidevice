@@ -61,7 +61,7 @@ func newMcpTestApp(withAuth bool) *fiber.App {
 	return app
 }
 
-func TestMcpEndpointListsSixTools(t *testing.T) {
+func TestMcpEndpointListsSevenTools(t *testing.T) {
 	app := newMcpTestApp(false)
 
 	rec, initRes := mcpRPC(t, app, initializeRPC, false)
