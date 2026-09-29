@@ -359,7 +359,20 @@ func TestOAuthQRLinkingSupportsMultipleWhatsAppAccounts(t *testing.T) {
 	if resp.StatusCode != fiber.StatusFound {
 		failureBody, readErr := io.ReadAll(resp.Body)
 		require.NoError(t, readErr)
-		t.Fatalf("multi-account completion status=%d body=%s", resp.StatusCode, string(failureBody))
+		pending, ok := srv.pendingLink(secondMatch[1])
+		var probeErr error
+		if ok && pending != nil {
+			deviceIDs := append([]string(nil), pending.LinkedDeviceIDs...)
+			if !containsDeviceID(deviceIDs, pending.DeviceID) {
+				deviceIDs = append(deviceIDs, pending.DeviceID)
+			}
+			_, probeErr = srv.store.issueAuthorizationCode(context.Background(), AuthorizationGrant{
+				ClientID: pending.Request.ClientID, Subject: DevicesSubject(deviceIDs),
+				RedirectURI: pending.Request.RedirectURI, CodeChallenge: pending.Request.CodeChallenge,
+				Resource: pending.Request.Resource, Scope: pending.Request.Scope,
+			}, srv.now(), codeTTL)
+		}
+		t.Fatalf("multi-account completion status=%d body=%s pending=%t probeErr=%v", resp.StatusCode, string(failureBody), ok, probeErr)
 	}
 	callback, err := url.Parse(resp.Header.Get("Location"))
 	require.NoError(t, err)
