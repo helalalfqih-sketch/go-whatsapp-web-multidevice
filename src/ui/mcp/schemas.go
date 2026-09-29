@@ -1,3 +1,5 @@
+package mcp
+
 const catalogSchema = `{
   "type": "object",
   "required": ["action"],
@@ -16,8 +18,6 @@ const catalogSchema = `{
     }
   ]
 }`
-
-package mcp
 
 // Raw JSON Schemas for the consolidated tools. mcp-go validates tool calls
 // against these before handlers run (santhosh-tekuri/jsonschema/v6), so the
