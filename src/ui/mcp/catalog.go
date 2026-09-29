@@ -2,12 +2,12 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	mcpg "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.mau.fi/whatsmeow"
@@ -57,7 +57,7 @@ func (h *CatalogHandler) AddCatalogTools(mcpServer *server.MCPServer) {
 		mcpg.WithReadOnlyHintAnnotation(true),
 		mcpg.WithDestructiveHintAnnotation(false),
 		mcpg.WithIdempotentHintAnnotation(true),
-		mcpg.WithRawInputSchema([]byte(catalogSchema)),
+		mcpg.WithRawInputSchema(json.RawMessage(catalogSchema)),
 	)
 	tool.InputSchema = mcpg.ToolInputSchema{}
 	mcpServer.AddTool(tool, h.handleCatalog)
@@ -301,4 +301,3 @@ func attrBool(value any) bool {
 	}
 }
 
-var _ = whatsapp.ContextWithDevice
