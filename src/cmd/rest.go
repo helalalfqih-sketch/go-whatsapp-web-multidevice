@@ -236,6 +236,11 @@ func restServer(_ *cobra.Command, _ []string) {
 		if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 			logrus.Warnf("HTTP server shutdown: %v", err)
 		}
+		if stateBackup != nil {
+			backupCtx, backupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			stateBackup.StopAndFlush(backupCtx)
+			backupCancel()
+		}
 		// Release any Chatwoot direct-Postgres importer pools opened by per-device
 		// sync services. Safe when Chatwoot is disabled or none were initialized.
 		if err := chatwoot.CloseAllSyncServices(); err != nil {
