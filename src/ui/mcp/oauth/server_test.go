@@ -372,7 +372,13 @@ func TestOAuthQRLinkingSupportsMultipleWhatsAppAccounts(t *testing.T) {
 				Resource: pending.Request.Resource, Scope: pending.Request.Scope,
 			}, srv.now(), codeTTL)
 		}
-		t.Fatalf("multi-account completion status=%d body=%s pending=%t probeErr=%v", resp.StatusCode, string(failureBody), ok, probeErr)
+		var pendingClientID string
+		var clientLookupErr error
+		if ok && pending != nil {
+			pendingClientID = pending.Request.ClientID
+			_, clientLookupErr = srv.store.getClient(context.Background(), pendingClientID)
+		}
+		t.Fatalf("multi-account completion status=%d body=%s pending=%t originalClientID=%q pendingClientID=%q clientLookupErr=%v probeErr=%v", resp.StatusCode, string(failureBody), ok, clientID, pendingClientID, clientLookupErr, probeErr)
 	}
 	callback, err := url.Parse(resp.Header.Get("Location"))
 	require.NoError(t, err)
