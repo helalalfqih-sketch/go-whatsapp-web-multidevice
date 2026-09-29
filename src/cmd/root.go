@@ -53,6 +53,7 @@ var (
 	newsletterUsecase domainNewsletter.INewsletterUsecase
 	deviceUsecase     domainDevice.IDeviceUsecase
 	scheduleStop      func()
+	stateBackup       *stateBackupManager
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -687,6 +688,9 @@ func initApp() {
 
 	ctx := context.Background()
 
+	stateBackup = newStateBackupManagerFromEnv()
+	stateBackup.RestoreIfNeeded(ctx)
+
 	chatStorageDB, err = initChatStorage()
 	if err != nil {
 		// Terminate the application if chat storage fails to initialize to avoid nil pointer panics later.
@@ -695,6 +699,7 @@ func initApp() {
 
 	chatStorageRepo = chatstorage.NewStorageRepository(chatStorageDB)
 	chatStorageRepo.InitializeSchema()
+	stateBackup.RestoreDeviceRegistry(chatStorageDB)
 
 	whatsappDB := whatsapp.InitWaDB(ctx, config.DBURI)
 	var keysDB *sqlstore.Container
@@ -734,6 +739,7 @@ func initApp() {
 		case <-time.After(10 * time.Second):
 		}
 	}
+	stateBackup.Start()
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
