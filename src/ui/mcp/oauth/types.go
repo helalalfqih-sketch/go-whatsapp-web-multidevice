@@ -30,6 +30,7 @@ type WhatsAppLink struct {
 
 type WhatsAppLinker interface {
 	Start(ctx context.Context) (WhatsAppLink, error)
+	Refresh(ctx context.Context, deviceID string) (WhatsAppLink, error)
 	IsLinked(ctx context.Context, deviceID string) (bool, error)
 	Cleanup(ctx context.Context, deviceID string) error
 }
