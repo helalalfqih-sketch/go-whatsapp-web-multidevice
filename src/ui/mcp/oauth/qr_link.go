@@ -212,9 +212,31 @@ func (s *Server) completeWhatsAppLink(c fiber.Ctx) error {
 		return s.renderWhatsAppLink(c, fiber.StatusBadGateway, ticket, &copy, "Could not verify the WhatsApp connection. Try again.")
 	}
 	if !linked {
-		copy := *pending
+		deviceID := pending.DeviceID
 		s.links.mu.Unlock()
-		return s.renderWhatsAppLink(c, fiber.StatusConflict, ticket, &copy, "WhatsApp is not linked yet. Scan the QR code first, then continue.")
+
+		refreshed, refreshErr := s.linker.Refresh(c.Context(), deviceID)
+		s.links.mu.Lock()
+		current, stillPending := s.links.pending[ticket]
+		if stillPending && current != nil && refreshErr == nil &&
+			strings.TrimSpace(refreshed.DeviceID) == deviceID &&
+			strings.TrimSpace(refreshed.QRBase64) != "" {
+			current.QRBase64 = refreshed.QRBase64
+			current.ExpiresAt = s.now().Add(qrLinkTTL)
+		}
+		var copy pendingWhatsAppLink
+		if stillPending && current != nil {
+			copy = *current
+		}
+		s.links.mu.Unlock()
+
+		if !stillPending || current == nil {
+			return oauthError(c, fiber.StatusBadRequest, "invalid_request", "WhatsApp link ticket is invalid or expired")
+		}
+		if refreshErr != nil {
+			return s.renderWhatsAppLink(c, fiber.StatusConflict, ticket, &copy, "WhatsApp is not linked yet, and the QR refresh failed. Restart the connection.")
+		}
+		return s.renderWhatsAppLink(c, fiber.StatusConflict, ticket, &copy, "WhatsApp is not linked yet. A fresh QR code has been generated — scan the new code, then continue.")
 	}
 
 	req := pending.Request
