@@ -1,3 +1,22 @@
+const catalogSchema = `{
+  "type": "object",
+  "required": ["action"],
+  "properties": {
+    "action": {"type": "string", "enum": ["list_products","get_product","list_collections"], "description": "Read-only WhatsApp Business catalog operation"},
+    "device_id": {"type": "string", "description": "Act as this device instead of the OAuth-bound/default device"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "list_products/list_collections: max items per request"},
+    "cursor": {"type": "string", "description": "list_products: pagination cursor returned by the previous call"},
+    "product_id": {"type": "string", "description": "get_product: WhatsApp catalog product ID"},
+    "retailer_id": {"type": "string", "description": "get_product: retailer-defined product ID"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"action": {"const": "get_product"}}},
+      "then": {"anyOf": [{"required": ["product_id"]}, {"required": ["retailer_id"]}]}
+    }
+  ]
+}`
+
 package mcp
 
 // Raw JSON Schemas for the consolidated tools. mcp-go validates tool calls
