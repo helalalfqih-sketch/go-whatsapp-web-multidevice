@@ -241,6 +241,10 @@ func routingPathKey(p string) string {
 
 func (s *Server) MCPAuthMiddleware(basic CredentialValidator) fiber.Handler {
 	return func(c fiber.Ctx) error {
+		// This header is internal trust context. Never accept a client-supplied
+		// value; bearer validation below recreates it from the token subject.
+		c.Request().Header.Del(AllowedDevicesHeader)
+
 		scheme, credentials := splitAuthorization(c.Get(fiber.HeaderAuthorization))
 		switch strings.ToLower(scheme) {
 		case "bearer":
@@ -253,11 +257,27 @@ func (s *Server) MCPAuthMiddleware(basic CredentialValidator) fiber.Handler {
 			}
 			c.Locals("oauth_subject", principal.Subject)
 			c.Locals("oauth_client_id", principal.ClientID)
-			if deviceID, ok := DeviceIDFromSubject(principal.Subject); ok {
-				// Bearer tokens issued by the QR flow are hard-bound to one
-				// WhatsApp device. Overwrite any client-supplied selector before
-				// the MCP HTTP adaptor sees the request.
-				c.Request().Header.Set("X-Device-Id", deviceID)
+
+			deviceIDs, ok := DeviceIDsFromSubject(principal.Subject)
+			if !ok {
+				// Once QR-bound OAuth is enabled, legacy bearer tokens without
+				// a WhatsApp device scope must not regain arbitrary device access.
+				if s.qrLinking {
+					return s.mcpUnauthorized(c, basic != nil, true)
+				}
+				return c.Next()
+			}
+			c.Request().Header.Set(AllowedDevicesHeader, strings.Join(deviceIDs, ","))
+
+			requested := strings.TrimSpace(c.Get("X-Device-Id"))
+			if len(deviceIDs) == 1 {
+				// Preserve the original single-account behavior.
+				c.Request().Header.Set("X-Device-Id", deviceIDs[0])
+			} else if requested == "" || !containsDeviceID(deviceIDs, requested) {
+				// A multi-account token may select only one of its own devices.
+				// Clear an absent or unauthorized client header; tool-level
+				// device_id selection is checked again inside resolveDeviceContext.
+				c.Request().Header.Del("X-Device-Id")
 			}
 			return c.Next()
 		case "basic":
