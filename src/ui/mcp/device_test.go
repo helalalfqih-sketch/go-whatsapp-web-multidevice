@@ -67,7 +67,7 @@ func TestResolveDeviceContext(t *testing.T) {
 		r := &stubResolver{inst: boundDevice}
 		ctx := withOAuthBoundDevice(context.Background(), "dev1")
 		_, _, err := resolveDeviceContext(ctx, callReq(map[string]any{"device_id": "dev2"}), r)
-		require.ErrorContains(t, err, "does not match")
+		require.ErrorContains(t, err, "not authorized")
 		assert.Empty(t, r.gotID)
 	})
 
