@@ -285,7 +285,6 @@ func (s *store) exchangeAuthorizationCode(
 	now time.Time,
 	accessTTL time.Duration,
 	refreshTTL time.Duration,
-	postgres bool,
 ) (TokenPair, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
