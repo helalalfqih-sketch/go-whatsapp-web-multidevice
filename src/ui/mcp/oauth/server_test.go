@@ -53,6 +53,13 @@ func (f *fakeWhatsAppLinker) Start(context.Context) (WhatsAppLink, error) {
 	}, nil
 }
 
+func (f *fakeWhatsAppLinker) Refresh(_ context.Context, deviceID string) (WhatsAppLink, error) {
+	return WhatsAppLink{
+		DeviceID: deviceID,
+		QRBase64: base64.StdEncoding.EncodeToString([]byte("refreshed-fake-png")),
+	}, nil
+}
+
 func (f *fakeWhatsAppLinker) IsLinked(context.Context, string) (bool, error) {
 	return f.linked, nil
 }
