@@ -20,19 +20,31 @@ type deviceResolver interface {
 // DeviceMiddleware semantics for MCP handlers.
 func resolveDeviceContext(ctx context.Context, request mcpg.CallToolRequest, resolver deviceResolver) (context.Context, *whatsapp.DeviceInstance, error) {
 	requestedDeviceID := strings.TrimSpace(request.GetString("device_id", ""))
-	if boundDeviceID, ok := oauthBoundDevice(ctx); ok {
-		if requestedDeviceID != "" && requestedDeviceID != boundDeviceID {
-			return ctx, nil, errors.New("device_id does not match the WhatsApp account bound to this OAuth token")
+
+	if allowedDeviceIDs, ok := oauthAllowedDevices(ctx); ok {
+		deviceID := requestedDeviceID
+		if deviceID == "" {
+			if len(allowedDeviceIDs) == 1 {
+				deviceID = allowedDeviceIDs[0]
+			} else if inst, hasContextDevice := whatsapp.DeviceFromContext(ctx); hasContextDevice && inst != nil {
+				deviceID = inst.ID()
+			} else {
+				return ctx, nil, errors.New("multiple WhatsApp accounts are linked to this OAuth connection; pass device_id to choose an account")
+			}
+		}
+		if !containsAllowedDevice(allowedDeviceIDs, deviceID) {
+			return ctx, nil, errors.New("device_id is not authorized for this OAuth connection")
 		}
 		if resolver == nil {
 			return ctx, nil, errors.New("device manager not initialized")
 		}
-		inst, _, err := resolver.ResolveDevice(boundDeviceID)
+		inst, _, err := resolver.ResolveDevice(deviceID)
 		if err != nil {
 			return ctx, nil, err
 		}
 		return whatsapp.ContextWithDevice(ctx, inst), inst, nil
 	}
+
 	if deviceID := requestedDeviceID; deviceID != "" {
 		if resolver == nil {
 			return ctx, nil, errors.New("device manager not initialized")
@@ -47,4 +59,14 @@ func resolveDeviceContext(ctx context.Context, request mcpg.CallToolRequest, res
 		return ctx, inst, nil
 	}
 	return ctx, nil, errors.New("device identification required: set the X-Device-Id header or pass device_id")
+}
+
+func containsAllowedDevice(deviceIDs []string, deviceID string) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	for _, allowed := range deviceIDs {
+		if strings.TrimSpace(allowed) == deviceID && deviceID != "" {
+			return true
+		}
+	}
+	return false
 }
