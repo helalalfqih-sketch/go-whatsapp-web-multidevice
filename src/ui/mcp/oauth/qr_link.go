@@ -12,14 +12,18 @@ import (
 	"github.com/gofiber/fiber/v3"
 )
 
-const qrLinkTTL = 4 * time.Minute
+const (
+	qrLinkTTL               = 4 * time.Minute
+	maxOAuthWhatsAppDevices = 10
+)
 
 type pendingWhatsAppLink struct {
-	Request   authorizationRequest
-	Client    Client
-	DeviceID  string
-	QRBase64  string
-	ExpiresAt time.Time
+	Request         authorizationRequest
+	Client          Client
+	DeviceID        string
+	QRBase64        string
+	LinkedDeviceIDs []string
+	ExpiresAt       time.Time
 }
 
 type linkState struct {
@@ -32,12 +36,15 @@ func newLinkState() *linkState {
 }
 
 type linkPageData struct {
-	ClientName   string
-	DeviceID     string
-	QRBase64     string
-	Ticket       string
-	CompletePath string
-	Error        string
+	ClientName    string
+	DeviceID      string
+	QRBase64      string
+	Ticket        string
+	CompletePath  string
+	LinkedCount   int
+	MaxDevices    int
+	CanAddAnother bool
+	Error         string
 }
 
 var whatsappLinkTemplate = template.Must(template.New("oauth-whatsapp-link").Parse(`<!doctype html>
@@ -53,11 +60,20 @@ var whatsappLinkTemplate = template.Must(template.New("oauth-whatsapp-link").Par
   <p>Open WhatsApp on your phone → Settings → Linked devices → Link a device, then scan this QR code.</p>
   {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
   <img src="data:image/png;base64,{{.QRBase64}}" alt="WhatsApp linking QR code">
+  <p class="muted">{{.LinkedCount}} account(s) already linked in this sign-in.</p>
   <form method="post" action="{{.CompletePath}}">
     <input type="hidden" name="ticket" value="{{.Ticket}}">
-    <button type="submit">I scanned the QR — continue</button>
+    <input type="hidden" name="action" value="complete">
+    <button type="submit">I scanned the QR — continue to ChatGPT</button>
   </form>
-  <p class="muted">This OAuth connection will be locked to device {{.DeviceID}}. It will not be allowed to switch to another WhatsApp account.</p>
+  {{if .CanAddAnother}}
+  <form method="post" action="{{.CompletePath}}">
+    <input type="hidden" name="ticket" value="{{.Ticket}}">
+    <input type="hidden" name="action" value="add">
+    <button type="submit">I scanned the QR — add another WhatsApp account</button>
+  </form>
+  {{end}}
+  <p class="muted">This OAuth connection will be restricted to the WhatsApp accounts linked during this sign-in. Maximum {{.MaxDevices}} accounts.</p>
 </body>
 </html>`))
 
@@ -135,6 +151,11 @@ func (s *Server) expireWhatsAppLink(ticket, deviceID string, expiresAt time.Time
 	}
 	s.links.mu.Unlock()
 	if ok && s.linker != nil {
+		if pending != nil {
+			for _, linkedDeviceID := range pending.LinkedDeviceIDs {
+				_ = s.linker.Cleanup(context.Background(), linkedDeviceID)
+			}
+		}
 		_ = s.linker.Cleanup(context.Background(), deviceID)
 	}
 }
@@ -143,11 +164,19 @@ func (s *Server) completeWhatsAppLink(c fiber.Ctx) error {
 	s.setNoStore(c)
 	var body struct {
 		Ticket string `form:"ticket"`
+		Action string `form:"action"`
 	}
 	if err := c.Bind().Body(&body); err != nil || strings.TrimSpace(body.Ticket) == "" {
 		return oauthError(c, fiber.StatusBadRequest, "invalid_request", "invalid WhatsApp link ticket")
 	}
 	ticket := strings.TrimSpace(body.Ticket)
+	action := strings.TrimSpace(body.Action)
+	if action == "" {
+		action = "complete"
+	}
+	if action != "complete" && action != "add" {
+		return oauthError(c, fiber.StatusBadRequest, "invalid_request", "invalid WhatsApp link action")
+	}
 
 	if s.links == nil || s.linker == nil {
 		return oauthError(c, fiber.StatusServiceUnavailable, "temporarily_unavailable", "WhatsApp QR linking is not configured")
@@ -180,10 +209,62 @@ func (s *Server) completeWhatsAppLink(c fiber.Ctx) error {
 	}
 
 	req := pending.Request
-	deviceID := pending.DeviceID
+	deviceIDs := append([]string(nil), pending.LinkedDeviceIDs...)
+	if !containsDeviceID(deviceIDs, pending.DeviceID) {
+		deviceIDs = append(deviceIDs, pending.DeviceID)
+	}
+
+	if action == "add" {
+		if len(deviceIDs) >= maxOAuthWhatsAppDevices {
+			copy := *pending
+			copy.LinkedDeviceIDs = deviceIDs
+			s.links.mu.Unlock()
+			return s.renderWhatsAppLink(c, fiber.StatusBadRequest, ticket, &copy, "Maximum WhatsApp accounts reached for this connection.")
+		}
+
+		nextLink, err := s.linker.Start(c.Context())
+		if err != nil {
+			copy := *pending
+			copy.LinkedDeviceIDs = deviceIDs
+			s.links.mu.Unlock()
+			return s.renderWhatsAppLink(c, fiber.StatusBadGateway, ticket, &copy, "Could not start another WhatsApp link. You can continue with the accounts already linked.")
+		}
+		if strings.TrimSpace(nextLink.DeviceID) == "" || strings.TrimSpace(nextLink.QRBase64) == "" {
+			_ = s.linker.Cleanup(context.Background(), nextLink.DeviceID)
+			copy := *pending
+			copy.LinkedDeviceIDs = deviceIDs
+			s.links.mu.Unlock()
+			return s.renderWhatsAppLink(c, fiber.StatusBadGateway, ticket, &copy, "Could not start another WhatsApp link. You can continue with the accounts already linked.")
+		}
+
+		nextTicket, err := randomSecret("gowa_link_", 32)
+		if err != nil {
+			_ = s.linker.Cleanup(context.Background(), nextLink.DeviceID)
+			copy := *pending
+			copy.LinkedDeviceIDs = deviceIDs
+			s.links.mu.Unlock()
+			return s.renderWhatsAppLink(c, fiber.StatusInternalServerError, ticket, &copy, "Could not create another WhatsApp link ticket.")
+		}
+		expiresAt := s.now().Add(qrLinkTTL)
+		delete(s.links.pending, ticket)
+		s.links.pending[nextTicket] = &pendingWhatsAppLink{
+			Request:         req,
+			Client:          pending.Client,
+			DeviceID:        nextLink.DeviceID,
+			QRBase64:        nextLink.QRBase64,
+			LinkedDeviceIDs: deviceIDs,
+			ExpiresAt:       expiresAt,
+		}
+		nextPending := *s.links.pending[nextTicket]
+		s.links.mu.Unlock()
+
+		go s.expireWhatsAppLink(nextTicket, nextLink.DeviceID, expiresAt)
+		return s.renderWhatsAppLink(c, fiber.StatusOK, nextTicket, &nextPending, "")
+	}
+
 	code, err := s.store.issueAuthorizationCode(c.Context(), AuthorizationGrant{
 		ClientID:      req.ClientID,
-		Subject:       DeviceSubject(deviceID),
+		Subject:       DevicesSubject(deviceIDs),
 		RedirectURI:   req.RedirectURI,
 		CodeChallenge: req.CodeChallenge,
 		Resource:      req.Resource,
@@ -222,12 +303,15 @@ func (s *Server) renderWhatsAppLink(c fiber.Ctx, status int, ticket string, pend
 	c.Type("html", "utf-8")
 	c.Status(status)
 	return whatsappLinkTemplate.Execute(c, linkPageData{
-		ClientName:   pending.Client.Name,
-		DeviceID:     pending.DeviceID,
-		QRBase64:     pending.QRBase64,
-		Ticket:       ticket,
-		CompletePath: s.issuerEndpointPath("/oauth/link/complete"),
-		Error:        pageError,
+		ClientName:    pending.Client.Name,
+		DeviceID:      pending.DeviceID,
+		QRBase64:      pending.QRBase64,
+		Ticket:        ticket,
+		CompletePath:  s.issuerEndpointPath("/oauth/link/complete"),
+		LinkedCount:   len(pending.LinkedDeviceIDs),
+		MaxDevices:    maxOAuthWhatsAppDevices,
+		CanAddAnother: len(pending.LinkedDeviceIDs)+1 < maxOAuthWhatsAppDevices,
+		Error:         pageError,
 	})
 }
 
@@ -237,4 +321,14 @@ func whatsappLinkPageCSP(redirectURI string) string {
 		formAction += " " + origin
 	}
 	return fmt.Sprintf("default-src 'none'; img-src data:; style-src 'unsafe-inline'; form-action %s; frame-ancestors 'none'; base-uri 'none'", formAction)
+}
+
+func containsDeviceID(deviceIDs []string, deviceID string) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	for _, id := range deviceIDs {
+		if strings.TrimSpace(id) == deviceID && deviceID != "" {
+			return true
+		}
+	}
+	return false
 }
